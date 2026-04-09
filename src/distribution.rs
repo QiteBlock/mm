@@ -75,12 +75,17 @@ pub fn generate_quotes(
     // Use the clamped fraction for all price calculations.
     let as_half_spread_frac = as_half_spread_bps / Decimal::from(10_000u64);
 
-    // A-S reservation price: mid shifted by A-S term + explicit inventory lean.
-    // inventory_lean_bps shifts reservation by that many bps at max position (pos_ratio=1),
-    // linearly with pos_ratio. This dominates over the tiny γσ²T term at normal vol.
+    // A-S reservation price: mid shifted by A-S term + inventory lean + ob_imbalance lean.
+    // ob_imbalance shifts mid toward the pressure direction before the move happens:
+    //   positive ob_imbalance (bid-heavy) → reservation shifts up → quotes shift up
+    //   negative ob_imbalance (ask-heavy) → reservation shifts down
     let mid = factors.price_index;
     let inventory_lean_frac = parsed.model.inventory_lean_bps / Decimal::from(10_000u64);
-    let as_reservation_price = mid * (Decimal::ONE - pos_ratio * gamma_sigma2_t - pos_ratio * inventory_lean_frac);
+    let ob_weight = parsed.factors.ob_imbalance_weight;
+    // ob_imbalance_lean: at full imbalance (±1) and weight=1, shifts mid by ±ob_weight bps.
+    let ob_lean_frac = factors.ob_imbalance * ob_weight / Decimal::from(10_000u64);
+    let as_reservation_price = mid
+        * (Decimal::ONE - pos_ratio * gamma_sigma2_t - pos_ratio * inventory_lean_frac + ob_lean_frac);
 
     // S6: volume_imbalance is purely a size scalar (>= 0).
     let volume_factor = (Decimal::ONE + factors.volume_imbalance).max(Decimal::ZERO);
@@ -97,6 +102,29 @@ pub fn generate_quotes(
     let ask_skew = (Decimal::ONE - position_signal * spread_multiplier)
         .max(Decimal::ZERO)
         .min(Decimal::new(3, 0));
+
+    // OB imbalance: asymmetric spread and size adjustments.
+    // Positive ob_imbalance = bid-heavy = ask side is about to be swept:
+    //   → widen ask spread (protect from adverse selection)
+    //   → tighten bid spread (lean into the upward pressure, be more competitive)
+    //   → reduce ask size (don't give away cheap asks into bid sweep)
+    //   → boost bid size (more aggressive on the safe side)
+    // Negative ob_imbalance = ask-heavy: mirror image.
+    let ob = factors.ob_imbalance * ob_weight.min(Decimal::ONE);
+    // ob_spread_multiplier ∈ [0.5, 1.5] at full imbalance.
+    let ob_ask_spread_mult = (Decimal::ONE + ob * Decimal::new(5, 1))
+        .max(Decimal::new(5, 1))
+        .min(Decimal::new(15, 1));
+    let ob_bid_spread_mult = (Decimal::ONE - ob * Decimal::new(5, 1))
+        .max(Decimal::new(5, 1))
+        .min(Decimal::new(15, 1));
+    // ob_size_multiplier ∈ [0.5, 1.5] at full imbalance.
+    let ob_ask_size_mult = (Decimal::ONE - ob * Decimal::new(4, 1))
+        .max(Decimal::new(5, 1))
+        .min(Decimal::new(15, 1));
+    let ob_bid_size_mult = (Decimal::ONE + ob * Decimal::new(4, 1))
+        .max(Decimal::new(5, 1))
+        .min(Decimal::new(15, 1));
 
     // S5: Continuous regime scaling.
     let intensity = factors.regime_intensity;
@@ -145,8 +173,10 @@ pub fn generate_quotes(
         gamma_sigma2_t = %gamma_sigma2_t,
         as_half_spread_bps = %as_half_spread_bps,
         reservation_price = %as_reservation_price,
-        reservation_shift_bps = %((pos_ratio * gamma_sigma2_t + pos_ratio * inventory_lean_frac) * Decimal::from(10_000u64)),
+        reservation_shift_bps = %((pos_ratio * gamma_sigma2_t + pos_ratio * inventory_lean_frac - ob_lean_frac) * Decimal::from(10_000u64)),
         inventory_lean_bps = %parsed.model.inventory_lean_bps,
+        ob_imbalance = %factors.ob_imbalance,
+        ob_lean_bps = %(ob_lean_frac * Decimal::from(10_000u64)),
         as_bid = %as_bid,
         as_ask = %as_ask,
         anchor_bid = %anchor_bid,
@@ -177,11 +207,12 @@ pub fn generate_quotes(
         let level_half_spread_frac = level_spread_bps / Decimal::from(20_000u64); // half-spread
 
         // S1: Level 0 anchors to BBO (clamped to A-S); deeper levels step from anchor.
+        // OB imbalance multipliers widen the swept side and tighten the safe side.
         let (bid_price, ask_price) = if level == 0 {
             (anchor_bid, anchor_ask)
         } else {
-            let bid_spread = level_half_spread_frac * Decimal::TWO * bid_skew;
-            let ask_spread = level_half_spread_frac * Decimal::TWO * ask_skew;
+            let bid_spread = level_half_spread_frac * Decimal::TWO * bid_skew * ob_bid_spread_mult;
+            let ask_spread = level_half_spread_frac * Decimal::TWO * ask_skew * ob_ask_spread_mult;
             (
                 anchor_bid * (Decimal::ONE - bid_spread),
                 anchor_ask * (Decimal::ONE + ask_spread),
@@ -195,8 +226,8 @@ pub fn generate_quotes(
         let ask_fill_multiplier =
             fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, level);
 
-        let mut bid_size = (base_size * bid_fill_multiplier * bid_size_skew).max(Decimal::ZERO);
-        let mut ask_size = (base_size * ask_fill_multiplier * ask_size_skew).max(Decimal::ZERO);
+        let mut bid_size = (base_size * bid_fill_multiplier * bid_size_skew * ob_bid_size_mult).max(Decimal::ZERO);
+        let mut ask_size = (base_size * ask_fill_multiplier * ask_size_skew * ob_ask_size_mult).max(Decimal::ZERO);
 
         // S4: graduated toxic-flow sided reduction / safe-side boost.
         if flow_dir > Decimal::ZERO {

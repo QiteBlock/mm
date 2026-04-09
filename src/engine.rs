@@ -911,6 +911,7 @@ where
                 spread_addon = %factor_snapshot.volatility,
                 volume_imbalance = %factor_snapshot.volume_imbalance,
                 flow_direction = %factor_snapshot.flow_direction,
+                ob_imbalance = %factor_snapshot.ob_imbalance,
                 inventory_skew = %factor_snapshot.inventory_skew,
                 recent_trade_count = factor_snapshot.recent_trade_count,
                 degraded,

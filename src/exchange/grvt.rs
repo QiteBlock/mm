@@ -347,6 +347,43 @@ impl GrvtClient {
         self.place_orders(orders).await
     }
 
+    pub async fn submit_market_close_orders(&self, positions: &[Position]) -> Result<()> {
+        let min_close_notional = Decimal::new(5, 0);
+
+        let mut orders = Vec::new();
+        for position in positions.iter().filter(|p| p.quantity != Decimal::ZERO) {
+            // Use a rough mark price estimate for the dust-notional check.
+            // For market orders the price field is unused by the exchange.
+            let (bid, ask) = self.fetch_best_bid_ask_snapshot(&position.symbol).await?;
+            let ref_price = if position.quantity.is_sign_positive() { ask } else { bid };
+            let notional = position.quantity.abs() * ref_price;
+            if notional < min_close_notional {
+                warn!(
+                    symbol = %position.symbol,
+                    quantity = %position.quantity,
+                    notional = %notional,
+                    "skipping dust residual position in market cleanup"
+                );
+                continue;
+            }
+            let side = if position.quantity.is_sign_positive() { Side::Ask } else { Side::Bid };
+            orders.push(OrderRequest {
+                symbol: position.symbol.clone(),
+                contract_id: 0,
+                level_index: 0,
+                side,
+                order_type: OrderType::Market,
+                price: None,
+                quantity: position.quantity.abs(),
+                post_only: false,
+            });
+        }
+        if orders.is_empty() {
+            return Ok(());
+        }
+        self.place_orders(orders).await
+    }
+
     async fn load_instruments_uncached(&self) -> Result<Vec<GrvtInstrument>> {
         info!("grvt loading instruments");
         let response: GrvtAllInstrumentsResponse = self

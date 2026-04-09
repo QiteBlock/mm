@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async_tls_with_config,
-    tungstenite::{handshake::client::generate_key, http::Request, Message as WsMessage},
+    tungstenite::Message as WsMessage,
     Connector,
 };
 use tracing::{info, warn};
@@ -21,12 +21,11 @@ const RECONNECT_DELAY_SECS: u64 = 2;
 /// Stream Binance perpetual futures mark prices and re-emit as `MarketEvent::SpotPrice`.
 ///
 /// Two parallel data paths feed the same channel:
-/// 1. WebSocket `markPrice@1s` with an explicit native-tls connector — fires every second.
+/// 1. WebSocket `markPrice@1s` via native-tls — fires every second.
 /// 2. REST `premiumIndex` poll every 1 s — backup during WS reconnects.
 ///
-/// GRVT streams use `connect_async` which defaults to rustls; Binance uses
-/// `connect_async_tls_with_config` with `Connector::NativeTls` so the two
-/// TLS stacks are selected independently.
+/// GRVT streams use `connect_async` (rustls); Binance uses native-tls via
+/// `connect_async_tls_with_config` with an explicit `Connector::NativeTls`.
 pub async fn stream_binance_spot_prices(
     symbol_map: HashMap<String, String>,
     sender: mpsc::Sender<MarketEvent>,
@@ -57,25 +56,29 @@ pub async fn stream_binance_spot_prices(
         .map(|(grvt, binance)| (binance.to_lowercase(), grvt.clone()))
         .collect();
 
-    // Build native-tls connector once; clone it each reconnect attempt.
-    let tls_connector = native_tls::TlsConnector::builder()
-        .build()
-        .expect("native-tls connector build failed");
+    // Build native-tls connector once; reuse across reconnects.
+    let tls_connector = match native_tls::TlsConnector::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(err = %e, "native-tls build failed; Binance WS will not connect");
+            // Keep REST fallback running.
+            std::future::pending::<()>().await;
+            return Ok(());
+        }
+    };
 
     loop {
         info!(%ws_url, "connecting to Binance futures markPrice@1s stream (native-tls)");
 
-        let request = match build_ws_request(&ws_url) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(err = %e, "failed to build Binance WS request; retrying");
-                tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                continue;
-            }
-        };
-
         let connector = Connector::NativeTls(tls_connector.clone());
-        match connect_async_tls_with_config(request, None, false, Some(connector)).await {
+        match connect_async_tls_with_config(
+            ws_url.as_str(),
+            None,
+            false,
+            Some(connector),
+        )
+        .await
+        {
             Ok((ws_stream, _)) => {
                 let (mut write, mut read) = ws_stream.split();
                 loop {
@@ -107,7 +110,7 @@ pub async fn stream_binance_spot_prices(
                     }
 
                     if let Some(payload) = pong_payload {
-                        if let Err(e) = write.send(WsMessage::Pong(payload.into())).await {
+                        if let Err(e) = write.send(WsMessage::Pong(payload)).await {
                             warn!(err = %e, "failed to send Pong; reconnecting");
                             needs_reconnect = true;
                         }
@@ -136,7 +139,6 @@ pub async fn stream_binance_spot_prices(
 }
 
 /// Poll the Binance REST `premiumIndex` endpoint every 1 s per symbol.
-/// Completely independent `reqwest::Client` — separate from the GRVT exchange client.
 async fn poll_binance_rest(symbol_map: HashMap<String, String>, sender: mpsc::Sender<MarketEvent>) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -185,20 +187,6 @@ async fn poll_binance_rest(symbol_map: HashMap<String, String>, sender: mpsc::Se
     }
 }
 
-fn build_ws_request(url: &str) -> Result<Request<()>> {
-    let uri: tokio_tungstenite::tungstenite::http::Uri = url.parse()?;
-    let host = uri.host().unwrap_or("fstream.binance.com");
-    let request = Request::builder()
-        .uri(url)
-        .header("Host", host)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", generate_key())
-        .body(())?;
-    Ok(request)
-}
-
 fn process_frame(
     frame: WsMessage,
     reverse_map: &HashMap<String, String>,
@@ -213,7 +201,7 @@ fn process_frame(
             }
         }
         WsMessage::Ping(payload) => {
-            *pong_payload = Some(payload.to_vec());
+            *pong_payload = Some(payload);
         }
         WsMessage::Close(_) => {
             warn!("Binance WS close frame received; reconnecting");

@@ -210,6 +210,11 @@ impl AppConfig {
                     "factors.volatility_floor",
                     &self.factors.volatility_floor,
                 )?,
+                ob_imbalance_weight: parse_decimal(
+                    "factors.ob_imbalance_weight",
+                    &self.factors.ob_imbalance_weight,
+                )?,
+                ob_imbalance_depth: self.factors.ob_imbalance_depth,
             },
             pairs: self
                 .pairs
@@ -323,6 +328,11 @@ pub struct ParsedFactorConfig {
     pub regime_min_dwell_secs: u64,
     pub cross_symbol_vol_weight: Decimal,
     pub volatility_floor: Decimal,
+    /// How strongly ob_imbalance shifts the reservation price and asymmetric spread/size.
+    /// 0 = disabled, 0.5 = moderate, 1.0 = full effect.
+    pub ob_imbalance_weight: Decimal,
+    /// Number of top orderbook levels to sum when computing ob_imbalance (0 = all levels).
+    pub ob_imbalance_depth: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +442,10 @@ fn default_inventory_skew_convexity() -> String {
 
 fn default_regime_min_dwell_secs() -> u64 {
     3
+}
+
+fn default_ob_imbalance_depth() -> usize {
+    10
 }
 
 fn default_position_size_skew_weight() -> String {
@@ -573,6 +587,10 @@ pub struct FactorConfig {
     pub cross_symbol_vol_weight: String,
     #[serde(default = "default_zero_string")]
     pub volatility_floor: String,
+    #[serde(default = "default_zero_string")]
+    pub ob_imbalance_weight: String,
+    #[serde(default = "default_ob_imbalance_depth")]
+    pub ob_imbalance_depth: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

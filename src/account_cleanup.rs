@@ -15,6 +15,7 @@ use crate::{
 #[async_trait]
 pub trait CleanupExchange: OrderExecutor + PrivateDataSource + Sync {
     async fn submit_limit_close_orders(&self, positions: &[Position]) -> Result<()>;
+    async fn submit_market_close_orders(&self, positions: &[Position]) -> Result<()>;
     fn supports_limit_cleanup(&self) -> bool;
 }
 
@@ -95,18 +96,42 @@ async fn close_positions_with_limit_orders(
         return Ok(());
     }
 
+    // Limit orders exhausted — fall back to market orders to guarantee closure.
     let summary = residual_positions
         .iter()
         .map(|position| format!("{} {}", position.symbol, position.quantity))
         .collect::<Vec<_>>()
         .join(", ");
-    warn!(phase, residual = %summary, "limit-close cleanup exhausted retries");
+    warn!(phase, residual = %summary, "limit-close exhausted retries; closing by market order");
     notifier
         .send(format!(
-            "cleanup could not fully close positions with limit orders ({phase}): {summary}"
+            "cleanup: limit orders failed after {REPRICE_ATTEMPTS} attempts; closing by market ({phase}): {summary}"
         ))
         .await;
-    bail!("cleanup could not fully close positions with limit orders: {summary}")
+
+    exchange.cancel_all_orders().await?;
+    exchange.submit_market_close_orders(&residual_positions).await?;
+
+    // Give the market orders a moment to fill, then verify.
+    sleep(Duration::from_secs(2)).await;
+    let still_open = active_positions(&exchange.fetch_positions().await?);
+    if still_open.is_empty() {
+        info!(phase, "market-close cleanup succeeded");
+        return Ok(());
+    }
+
+    let still_summary = still_open
+        .iter()
+        .map(|position| format!("{} {}", position.symbol, position.quantity))
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(phase, residual = %still_summary, "market-close cleanup still has open positions");
+    notifier
+        .send(format!(
+            "cleanup: market close also failed ({phase}): {still_summary}"
+        ))
+        .await;
+    bail!("cleanup could not close positions even with market orders: {still_summary}")
 }
 
 fn active_positions(positions: &[Position]) -> Vec<Position> {
@@ -122,6 +147,13 @@ impl CleanupExchange for AnyExchangeClient {
     async fn submit_limit_close_orders(&self, positions: &[Position]) -> Result<()> {
         match self {
             AnyExchangeClient::Grvt(client) => client.submit_limit_close_orders(positions).await,
+            AnyExchangeClient::Hibachi(_) => Ok(()),
+        }
+    }
+
+    async fn submit_market_close_orders(&self, positions: &[Position]) -> Result<()> {
+        match self {
+            AnyExchangeClient::Grvt(client) => client.submit_market_close_orders(positions).await,
             AnyExchangeClient::Hibachi(_) => Ok(()),
         }
     }

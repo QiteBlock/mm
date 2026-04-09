@@ -182,6 +182,9 @@ pub struct FactorSnapshot {
     pub regime: MarketRegime,
     /// Continuous regime intensity in [0, 1]: 0 = fully Quiet, 1 = fully TrendingToxic. (S5)
     pub regime_intensity: Decimal,
+    /// Orderbook imbalance [-1, 1]: positive = bid-heavy (upward pressure), negative = ask-heavy.
+    /// Leading signal computed from top-N levels of the live orderbook.
+    pub ob_imbalance: Decimal,
 }
 
 #[derive(Clone, Debug)]

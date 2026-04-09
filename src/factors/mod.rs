@@ -213,6 +213,28 @@ impl FactorEngine {
         let volume_size_addon = rolling_volume * parsed.factors.volume_size_weight;
         let volume_imbalance = volume_size_addon.max(Decimal::ZERO);
 
+        // Orderbook imbalance: leading signal from top-N book levels.
+        // ob_imbalance ∈ [-1, 1]: positive = bid-heavy, negative = ask-heavy.
+        let ob_imbalance = {
+            let depth = parsed.factors.ob_imbalance_depth;
+            let bid_depth: Decimal = if depth == 0 {
+                market.bids.values().sum()
+            } else {
+                market.bids.iter().rev().take(depth).map(|(_, q)| *q).sum()
+            };
+            let ask_depth: Decimal = if depth == 0 {
+                market.asks.values().sum()
+            } else {
+                market.asks.iter().take(depth).map(|(_, q)| *q).sum()
+            };
+            let total = bid_depth + ask_depth;
+            if total.is_zero() {
+                Decimal::ZERO
+            } else {
+                ((bid_depth - ask_depth) / total).clamp(-Decimal::ONE, Decimal::ONE)
+            }
+        };
+
         Some(FactorSnapshot {
             price_index,
             raw_volatility: volatility,
@@ -223,6 +245,7 @@ impl FactorEngine {
             recent_trade_count,
             regime,
             regime_intensity,
+            ob_imbalance,
         })
     }
 }
