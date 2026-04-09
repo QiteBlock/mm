@@ -108,6 +108,7 @@ pub struct Position {
     pub entry_price: Decimal,
     pub realized_pnl: Decimal,
     pub unrealized_pnl: Decimal,
+    pub pnl_is_authoritative: bool,
 }
 
 #[derive(Clone, Debug)]

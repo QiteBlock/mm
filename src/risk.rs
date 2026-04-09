@@ -116,7 +116,7 @@ pub fn run_security_checks(
     parsed: &ParsedConfig,
     state: &BotState,
 ) -> Result<()> {
-    if state.pnl.total_pnl <= -parsed.risk.max_drawdown_usd {
+    if state.effective_total_pnl() <= -parsed.risk.max_drawdown_usd {
         bail!("drawdown limit breached");
     }
 

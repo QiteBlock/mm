@@ -1441,6 +1441,7 @@ fn parse_grvt_position(value: &Value) -> Option<Position> {
             .or_else(|| value.get("unrealised_pnl"))
             .and_then(as_decimal)
             .unwrap_or(Decimal::ZERO),
+        pnl_is_authoritative: true,
     })
 }
 

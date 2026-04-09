@@ -103,7 +103,7 @@ impl FillStore {
                 entry_price_after,
                 realized_pnl_after,
                 unrealized_pnl_after,
-                state.pnl.total_pnl.to_string(),
+                state.effective_total_pnl().to_string(),
             ],
         )?;
         self.insert_global_pnl_snapshot_locked(
@@ -159,7 +159,7 @@ impl FillStore {
                 if is_simulated { 1 } else { 0 },
                 realized_pnl.to_string(),
                 unrealized_pnl.to_string(),
-                state.pnl.total_pnl.to_string(),
+                state.effective_total_pnl().to_string(),
                 state.account_equity.to_string(),
                 fill_symbol,
                 fill_side,
@@ -203,6 +203,7 @@ impl FillStore {
                     entry_price: Decimal::from_str(&entry_price)?,
                     realized_pnl: Decimal::from_str(&realized_pnl)?,
                     unrealized_pnl: Decimal::ZERO,
+                    pnl_is_authoritative: false,
                 },
             );
         }

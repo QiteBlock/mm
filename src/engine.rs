@@ -764,6 +764,8 @@ where
         let unrealized_pnl = position
             .map(|position| position.unrealized_pnl)
             .unwrap_or(Decimal::ZERO);
+        let session_account_pnl = state.session_account_pnl();
+        let effective_total_pnl = state.effective_total_pnl();
 
         info!(
             symbol = %fill.symbol,
@@ -778,15 +780,18 @@ where
             position_quantity = %position_quantity,
             realized_pnl = %realized_pnl,
             unrealized_pnl = %unrealized_pnl,
+            account_equity = %state.account_equity,
+            startup_account_equity = ?state.startup_account_equity,
+            session_account_pnl = ?session_account_pnl,
             total_fees = %state.pnl.total_fees,
-            total_pnl = %state.pnl.total_pnl,
+            total_pnl = %effective_total_pnl,
             "fill recorded"
         );
 
         let fill_kind = if is_simulated { "simulated" } else { "live" };
         self.notifier
             .send(format!(
-                "{fill_kind} fill\nsymbol: {}\nside: {:?}\nlevel: {}\nprice: {}\nquantity: {}\nposition: {}\nrealized pnl: {}\nunrealized pnl: {}\nfees: {}\ntotal pnl: {}",
+                "{fill_kind} fill\nsymbol: {}\nside: {:?}\nlevel: {}\nprice: {}\nquantity: {}\nposition: {}\nrealized pnl: {}\nunrealized pnl: {}\naccount equity: {}\nstartup equity: {}\nsession pnl: {}\nfees: {}\ntotal pnl: {}",
                 fill.symbol,
                 fill.side,
                 level_index,
@@ -795,8 +800,16 @@ where
                 position_quantity,
                 realized_pnl,
                 unrealized_pnl,
+                state.account_equity,
+                state
+                    .startup_account_equity
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                session_account_pnl
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
                 state.pnl.total_fees,
-                state.pnl.total_pnl,
+                effective_total_pnl,
             ))
             .await;
         Ok(FillStats {
@@ -1419,8 +1432,11 @@ fn log_dry_run_inventory(state: &BotState) {
             entry_price = %position.entry_price,
             realized_pnl = %position.realized_pnl,
             unrealized_pnl = %position.unrealized_pnl,
+            account_equity = %state.account_equity,
+            startup_account_equity = ?state.startup_account_equity,
+            session_account_pnl = ?state.session_account_pnl(),
             total_fees = %state.pnl.total_fees,
-            total_pnl = %state.pnl.total_pnl,
+            total_pnl = %state.effective_total_pnl(),
             "dry-run inventory"
         );
     }
@@ -1478,6 +1494,7 @@ fn log_minute_stats(config: &AppConfig, state: &BotState, stats: &MinuteStats) {
     } else {
         Decimal::ZERO
     };
+    let session_account_pnl = state.session_account_pnl();
 
     info!(
         trade_count = stats.trade_count,
@@ -1489,8 +1506,11 @@ fn log_minute_stats(config: &AppConfig, state: &BotState, stats: &MinuteStats) {
         average_position = %average_position,
         realized_pnl = %realized_pnl,
         unrealized_pnl = %unrealized_pnl,
+        account_equity = %state.account_equity,
+        startup_account_equity = ?state.startup_account_equity,
+        session_account_pnl = ?session_account_pnl,
         total_fees = %state.pnl.total_fees,
-        total_pnl = %state.pnl.total_pnl,
+        total_pnl = %state.effective_total_pnl(),
         avg_spread_earned_bps = %avg_spread_earned_bps,
         toxic_fill_ratio = %toxic_fill_ratio,
         toxic_fill_count = stats.toxic_fill_count,

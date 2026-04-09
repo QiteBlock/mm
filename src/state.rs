@@ -17,6 +17,7 @@ pub struct BotState {
     pub fills: VecDeque<Fill>,
     pub pnl: PnlState,
     pub account_equity: Decimal,
+    pub startup_account_equity: Option<Decimal>,
     maker_fee_rate: Decimal,
 }
 
@@ -30,6 +31,7 @@ impl BotState {
             fills: VecDeque::new(),
             pnl: PnlState::default(),
             account_equity: Decimal::ZERO,
+            startup_account_equity: None,
             maker_fee_rate,
         }
     }
@@ -70,7 +72,7 @@ impl BotState {
             }
             PrivateEvent::Fill(fill) => self.apply_fill(fill),
             PrivateEvent::Position(position) => self.apply_position_update(position),
-            PrivateEvent::AccountEquity { equity } => self.account_equity = equity,
+            PrivateEvent::AccountEquity { equity } => self.apply_account_equity(equity),
         }
 
         self.refresh_unrealized_pnl();
@@ -89,6 +91,15 @@ impl BotState {
                 (position.quantity * mark).abs()
             })
             .sum()
+    }
+
+    pub fn session_account_pnl(&self) -> Option<Decimal> {
+        self.startup_account_equity
+            .map(|baseline| self.account_equity - baseline)
+    }
+
+    pub fn effective_total_pnl(&self) -> Decimal {
+        self.session_account_pnl().unwrap_or(self.pnl.total_pnl)
     }
 
     pub fn apply_dry_run_plan(
@@ -192,10 +203,21 @@ impl BotState {
         self.refresh_unrealized_pnl();
     }
 
+    fn apply_account_equity(&mut self, equity: Decimal) {
+        self.account_equity = equity;
+        if self.startup_account_equity.is_none() {
+            self.startup_account_equity = Some(equity);
+        }
+    }
+
     fn refresh_unrealized_pnl(&mut self) {
         let mut total = -self.pnl.total_fees;
         for position in self.positions.values_mut() {
             total += position.realized_pnl;
+            if position.pnl_is_authoritative {
+                total += position.unrealized_pnl;
+                continue;
+            }
             let Some(market) = self.market.symbols.get(&position.symbol) else {
                 position.unrealized_pnl = Decimal::ZERO;
                 continue;
@@ -213,16 +235,11 @@ impl BotState {
     fn apply_position_update(&mut self, position: Position) {
         let existing = self.positions.get(&position.symbol).cloned();
         let mut merged = position.clone();
+        merged.pnl_is_authoritative = true;
 
         if let Some(existing) = existing {
             if merged.entry_price.is_zero() && !merged.quantity.is_zero() {
                 merged.entry_price = existing.entry_price;
-            }
-            if existing.realized_pnl < merged.realized_pnl {
-                merged.realized_pnl = existing.realized_pnl;
-            }
-            if merged.unrealized_pnl.is_zero() && !existing.unrealized_pnl.is_zero() {
-                merged.unrealized_pnl = existing.unrealized_pnl;
             }
         }
 
@@ -254,8 +271,12 @@ impl BotState {
             }
         } else {
             let closed_quantity = previous_quantity.abs().min(fill_quantity.abs());
-            position.realized_pnl +=
-                (fill.price - position.entry_price) * closed_quantity * previous_quantity.signum();
+            if !position.pnl_is_authoritative {
+                position.realized_pnl +=
+                    (fill.price - position.entry_price)
+                        * closed_quantity
+                        * previous_quantity.signum();
+            }
 
             if new_quantity.is_zero() {
                 position.entry_price = Decimal::ZERO;

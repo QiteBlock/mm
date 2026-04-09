@@ -932,6 +932,7 @@ fn parse_position(value: &Value) -> Option<Position> {
             .and_then(as_decimal)
             .unwrap_or(Decimal::ZERO),
         unrealized_pnl,
+        pnl_is_authoritative: true,
     })
 }
 

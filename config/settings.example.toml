@@ -112,14 +112,14 @@ service_on = true
 side_filter = "both"
 
 [[pairs]]
-symbol = "LDO/USDT-P"
+symbol = "EDGE/USDT-P"
 enabled = true
 max_position_base = "500"
 price_source = "spot"
 post_only = true
 service_on = true
 side_filter = "both"
-binance_symbol = "ldousdt"
+binance_symbol = "edgeusdt"
 
 [telegram]
 enabled = false
