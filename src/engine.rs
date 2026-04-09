@@ -364,6 +364,9 @@ where
                         let should_handle_trip = last_breaker_message.as_deref()
                             != Some(breaker_message.as_str());
                         if !self.config.runtime.dry_run && should_handle_trip {
+                            // Always cancel all open orders when the breaker trips so that
+                            // stale resting orders cannot keep filling while the bot is locked out.
+                            self.exchange.cancel_all_orders().await?;
                             if should_flatten_on_breaker(&breaker_message) {
                                 flatten_account_state(
                                     self.exchange.as_ref(),
@@ -377,8 +380,6 @@ where
                                 for position in self.exchange.fetch_positions().await? {
                                     state.apply_private_event(PrivateEvent::Position(position));
                                 }
-                            } else {
-                                self.exchange.cancel_all_orders().await?;
                             }
                         }
                         if !suppress_cold_start_alert && should_handle_trip {
@@ -527,13 +528,13 @@ where
                             log_dry_run_inventory(&state);
                             log_dry_run_orders(&recon.to_place);
                         } else {
-                            // Cancel and place in parallel — cancels target old
-                            // price levels while places target new ones, so they
-                            // never conflict on the exchange.
-                            tokio::try_join!(
-                                self.exchange.cancel_orders(recon.to_cancel_order_ids.clone()),
-                                self.exchange.place_orders(recon.to_place.clone()),
-                            )?;
+                            // Cancel all existing orders atomically, then place new ones.
+                            // A single cancel_all is cheaper and guarantees no stale orders
+                            // survive (individual cancel+place races can leave orphans).
+                            if !recon.to_cancel_order_ids.is_empty() {
+                                self.exchange.cancel_all_orders().await?;
+                            }
+                            self.exchange.place_orders(recon.to_place.clone()).await?;
                             // Update last quoted price so the 3bps move detector
                             // uses the price we just quoted, not an older one.
                             for pair in self.config.pairs.iter().filter(|p| p.enabled) {
@@ -1748,7 +1749,10 @@ fn infer_fill_analytics(state: &BotState, fill: &Fill) -> (usize, Decimal) {
         .and_then(|order| order.level_index)
         .unwrap_or(0);
 
-    // Spread earned = our fill price distance from mid — actual captured edge, not BBO/2.
+    // Spread earned = fill price distance from GRVT mark/mid.
+    // Always use mark/mid (not spot_price) so that when price_source = "spot"
+    // (Binance) the reference is still the GRVT venue price, not the external
+    // reference — otherwise edge is near-zero because fill ≈ Binance mid.
     let mid = state
         .market
         .symbols
