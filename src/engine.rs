@@ -531,9 +531,7 @@ where
                             // Cancel all existing orders atomically, then place new ones.
                             // A single cancel_all is cheaper and guarantees no stale orders
                             // survive (individual cancel+place races can leave orphans).
-                            if !recon.to_cancel_order_ids.is_empty() {
-                                self.exchange.cancel_all_orders().await?;
-                            }
+                            self.exchange.cancel_all_orders().await?;
                             self.exchange.place_orders(recon.to_place.clone()).await?;
                             // Update last quoted price so the 3bps move detector
                             // uses the price we just quoted, not an older one.
