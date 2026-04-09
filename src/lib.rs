@@ -1,4 +1,5 @@
 pub mod account_cleanup;
+pub mod binance_feed;
 pub mod config;
 pub mod control;
 pub mod distribution;

@@ -111,11 +111,6 @@ impl HealthTracker {
         self.prune();
     }
 
-    fn record_rest_failure(&mut self) {
-        self.rest_failures.push_back(Instant::now());
-        self.prune();
-    }
-
     fn is_degraded(&self) -> bool {
         self.ws_discrepancies.len() >= 3 || self.rest_failures.len() >= 2
     }
@@ -276,9 +271,14 @@ where
             self.parsed.risk.circuit_breaker_cooldown_ms * 8,
             self.parsed.risk.circuit_breaker_cooldown_ms * 4,
         );
-        let mut ticker = interval(Duration::from_millis(
-            self.config.runtime.reconcile_interval_ms,
-        ));
+        // Poll at 100ms so price-move triggered requotes fire promptly.
+        // generation_min_interval_ms still controls actual reconcile cadence;
+        // setting last_generation_at = None bypasses it for urgent requotes.
+        let mut ticker = {
+            let mut t = interval(Duration::from_millis(100));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        };
         let mut stats_ticker = interval(Duration::from_secs(60));
         let mut toxicity_ticker = {
             let mut t = interval(Duration::from_secs(5));
@@ -286,7 +286,8 @@ where
             t
         };
         let mut last_generation_at: Option<Instant> = None;
-        let mut last_open_order_sync_at: Option<Instant> = None;
+        // Track the last-quoted price index per symbol to detect 3bps moves.
+        let mut last_quoted_price: HashMap<String, Decimal> = HashMap::new();
         let mut last_breaker_message: Option<String> = None;
         let mut minute_stats = MinuteStats::default();
 
@@ -307,22 +308,6 @@ where
                     ).await?;
                 }
                 _ = ticker.tick() => {
-                    if should_resync_open_orders(
-                        last_open_order_sync_at,
-                        self.config.runtime.reconcile_interval_ms,
-                    ) {
-                        match self.exchange.fetch_open_orders().await {
-                            Ok(exchange_orders) => {
-                                state.apply_private_event(PrivateEvent::OpenOrders(exchange_orders));
-                                last_open_order_sync_at = Some(Instant::now());
-                            }
-                            Err(err) => {
-                                health.record_rest_failure();
-                                return Err(err);
-                            }
-                        }
-                    }
-
                     if let Some(last_generation_at) = last_generation_at {
                         if last_generation_at.elapsed()
                             < Duration::from_millis(self.config.runtime.generation_min_interval_ms)
@@ -542,11 +527,22 @@ where
                             log_dry_run_inventory(&state);
                             log_dry_run_orders(&recon.to_place);
                         } else {
-                            self.exchange.cancel_orders(recon.to_cancel_order_ids.clone()).await?;
-                            self.exchange.place_orders(recon.to_place.clone()).await?;
-                            let exchange_orders = self.exchange.fetch_open_orders().await?;
-                            state.apply_private_event(PrivateEvent::OpenOrders(exchange_orders));
-                            last_open_order_sync_at = Some(Instant::now());
+                            // Cancel and place in parallel — cancels target old
+                            // price levels while places target new ones, so they
+                            // never conflict on the exchange.
+                            tokio::try_join!(
+                                self.exchange.cancel_orders(recon.to_cancel_order_ids.clone()),
+                                self.exchange.place_orders(recon.to_place.clone()),
+                            )?;
+                            // Update last quoted price so the 3bps move detector
+                            // uses the price we just quoted, not an older one.
+                            for pair in self.config.pairs.iter().filter(|p| p.enabled) {
+                                if let Some(price) = state.market.symbols.get(&pair.symbol)
+                                    .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
+                                {
+                                    last_quoted_price.insert(pair.symbol.clone(), price);
+                                }
+                            }
                         }
                     }
                 }
@@ -583,7 +579,32 @@ where
                     return Err(err);
                 }
                 maybe_market = market_rx.recv() => {
-                    let event = maybe_market.context("market stream disconnected")?;
+                    let first_event = maybe_market.context("market stream disconnected")?;
+
+                    // LIFO drain: collect all buffered events, deduplicate
+                    // non-trade events by (symbol, kind) keeping only the
+                    // freshest.  Trades are always processed in full for dry-run
+                    // fill simulation accuracy.
+                    let mut pending = vec![first_event];
+                    while let Ok(e) = market_rx.try_recv() {
+                        pending.push(e);
+                    }
+                    let mut deduped: HashMap<(String, u8), MarketEvent> = HashMap::new();
+                    let mut trade_events: Vec<MarketEvent> = Vec::new();
+                    for e in pending {
+                        match &e {
+                            MarketEvent::Trade { .. } => trade_events.push(e),
+                            MarketEvent::BestBidAsk { symbol, .. } => { deduped.insert((symbol.clone(), 0), e); }
+                            MarketEvent::MarkPrice { symbol, .. } => { deduped.insert((symbol.clone(), 1), e); }
+                            MarketEvent::SpotPrice { symbol, .. } => { deduped.insert((symbol.clone(), 2), e); }
+                            MarketEvent::OrderBookSnapshot { symbol, .. } => { deduped.insert((symbol.clone(), 3), e); }
+                            MarketEvent::OrderBookUpdate { symbol, .. } => { deduped.insert((symbol.clone(), 4), e); }
+                            MarketEvent::StreamReconnected { .. } => { deduped.insert((String::new(), 255), e); }
+                        }
+                    }
+                    let all_events: Vec<MarketEvent> = deduped.into_values().chain(trade_events).collect();
+
+                    for event in all_events {
                     if matches!(event, MarketEvent::Trade { .. }) {
                         minute_stats.trade_count += 1;
                     }
@@ -643,6 +664,27 @@ where
                                     ).await?;
                                     minute_stats.accumulate_fill(fs);
                                 }
+                        }
+                    }
+                    } // end for event in all_events
+
+                    // Force requote if any enabled symbol's price has moved >= 3bps
+                    // since the last reconcile.  Clear last_generation_at so the
+                    // next 100ms tick bypasses generation_min_interval_ms.
+                    'price_check: for pair in self.config.pairs.iter().filter(|p| p.enabled) {
+                        if let Some(new_price) = state.market.symbols.get(&pair.symbol)
+                            .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
+                        {
+                            if let Some(&old_price) = last_quoted_price.get(&pair.symbol) {
+                                if old_price > Decimal::ZERO {
+                                    let move_bps = ((new_price - old_price) / old_price).abs()
+                                        * Decimal::from(10_000u64);
+                                    if move_bps >= Decimal::new(3, 0) {
+                                        last_generation_at = None;
+                                        break 'price_check;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -758,6 +800,19 @@ where
         private_sender: mpsc::Sender<PrivateEvent>,
     ) -> JoinHandle<Result<()>> {
         let exchange = self.exchange.clone();
+        // Build Binance symbol map from pair configs that have binance_symbol set.
+        let binance_symbol_map: HashMap<String, String> = self
+            .config
+            .pairs
+            .iter()
+            .filter(|p| p.enabled)
+            .filter_map(|p| {
+                p.binance_symbol
+                    .as_ref()
+                    .map(|bs| (p.symbol.clone(), bs.clone()))
+            })
+            .collect();
+        let binance_sender = market_sender.clone();
         tokio::spawn(async move {
             tokio::try_join!(
                 exchange.stream_mark_prices(&symbols, market_sender.clone()),
@@ -766,6 +821,7 @@ where
                 exchange.stream_trades(&symbols, market_sender.clone()),
                 exchange.stream_orderbook(&symbols, market_sender),
                 exchange.stream_private_data(private_sender),
+                crate::binance_feed::stream_binance_spot_prices(binance_symbol_map, binance_sender),
             )?;
             Ok(())
         })
@@ -1533,13 +1589,6 @@ fn log_missed_fill_opportunity(
     } else {
         (false, false)
     }
-}
-
-fn should_resync_open_orders(last_sync_at: Option<Instant>, reconcile_interval_ms: u64) -> bool {
-    let Some(last_sync_at) = last_sync_at else {
-        return true;
-    };
-    last_sync_at.elapsed() >= Duration::from_millis(reconcile_interval_ms.saturating_mul(5))
 }
 
 fn should_flatten_on_breaker(message: &str) -> bool {

@@ -186,7 +186,7 @@ impl FactorEngine {
 
         // Continuous intensity: flow magnitude drives toxic intensity, vol drives volatile intensity.
         let flow_intensity = flow_abs.min(Decimal::ONE);
-        let vol_intensity = (volatility / Decimal::new(8, 4)).min(Decimal::ONE);
+        let vol_intensity = (volatility / Decimal::new(2, 3)).min(Decimal::ONE);
         let raw_intensity = flow_intensity.max(vol_intensity);
         // EWMA-smooth the intensity to prevent jitter.
         symbol_state.regime_intensity = Decimal::new(2, 1) * raw_intensity

@@ -75,10 +75,12 @@ pub fn generate_quotes(
     // Use the clamped fraction for all price calculations.
     let as_half_spread_frac = as_half_spread_bps / Decimal::from(10_000u64);
 
-    // A-S reservation price: mid shifted by inventory * risk aversion * variance * horizon.
-    // The shift is in price units; pos_ratio ∈ [-1, 1] so shift is bounded by γ·σ²·T·mid.
+    // A-S reservation price: mid shifted by A-S term + explicit inventory lean.
+    // inventory_lean_bps shifts reservation by that many bps at max position (pos_ratio=1),
+    // linearly with pos_ratio. This dominates over the tiny γσ²T term at normal vol.
     let mid = factors.price_index;
-    let as_reservation_price = mid - pos_ratio * gamma_sigma2_t * mid;
+    let inventory_lean_frac = parsed.model.inventory_lean_bps / Decimal::from(10_000u64);
+    let as_reservation_price = mid * (Decimal::ONE - pos_ratio * gamma_sigma2_t - pos_ratio * inventory_lean_frac);
 
     // S6: volume_imbalance is purely a size scalar (>= 0).
     let volume_factor = (Decimal::ONE + factors.volume_imbalance).max(Decimal::ZERO);
@@ -143,7 +145,8 @@ pub fn generate_quotes(
         gamma_sigma2_t = %gamma_sigma2_t,
         as_half_spread_bps = %as_half_spread_bps,
         reservation_price = %as_reservation_price,
-        reservation_shift_bps = %(pos_ratio * gamma_sigma2_t * Decimal::from(10_000u64)),
+        reservation_shift_bps = %((pos_ratio * gamma_sigma2_t + pos_ratio * inventory_lean_frac) * Decimal::from(10_000u64)),
+        inventory_lean_bps = %parsed.model.inventory_lean_bps,
         as_bid = %as_bid,
         as_ask = %as_ask,
         anchor_bid = %anchor_bid,
@@ -164,10 +167,13 @@ pub fn generate_quotes(
         let level_decimal = Decimal::from(level as u64);
 
         // Spread for this level: independent grid from born_inf to born_sup.
+        // Apply regime multiplier first, then clamp to fee floor so the
+        // floor is not itself scaled up by regime — it is a hard cost minimum.
         let unclamped_bps = (parsed.model.born_inf_bps + step * level_decimal)
-            .max(fee_floor_bps)
             * regime_spread_multiplier;
-        let level_spread_bps = unclamped_bps.min(parsed.model.max_spread_bps);
+        let level_spread_bps = unclamped_bps
+            .max(fee_floor_bps)
+            .min(parsed.model.max_spread_bps);
         let level_half_spread_frac = level_spread_bps / Decimal::from(20_000u64); // half-spread
 
         // S1: Level 0 anchors to BBO (clamped to A-S); deeper levels step from anchor.

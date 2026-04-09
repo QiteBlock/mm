@@ -80,8 +80,8 @@ impl GrvtClient {
                 network.private_rest_min_interval_ms,
             ))),
             // Separate low-latency governor for order placement/cancellation.
-            // 30ms allows up to ~33 order ops/sec while still preventing runaway loops.
-            order_governor: Arc::new(RestGovernor::new(Duration::from_millis(30))),
+            // 15ms allows up to ~66 order ops/sec while still preventing runaway loops.
+            order_governor: Arc::new(RestGovernor::new(Duration::from_millis(15))),
             request_policy: RequestPolicy::from_config(network),
             session_cookie: Arc::new(RwLock::new(None)),
             session_account_id: Arc::new(RwLock::new(None)),

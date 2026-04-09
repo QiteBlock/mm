@@ -37,9 +37,6 @@ impl AppConfig {
         if parsed.model.max_spread_bps < parsed.model.born_sup_bps {
             bail!("model.max_spread_bps must be >= model.born_sup_bps");
         }
-        if parsed.venue.maker_fee_rate < Decimal::ZERO {
-            bail!("venue.maker_fee_ratio must be non-negative");
-        }
         if parsed.venue.taker_fee_rate < Decimal::ZERO {
             bail!("venue.max_fee_rate must be non-negative");
         }
@@ -125,6 +122,7 @@ impl AppConfig {
                 as_gamma: parse_decimal("model.as_gamma", &self.model.as_gamma)?,
                 as_kappa: parse_decimal("model.as_kappa", &self.model.as_kappa)?,
                 as_time_horizon: parse_decimal("model.as_time_horizon", &self.model.as_time_horizon)?,
+                inventory_lean_bps: parse_decimal("model.inventory_lean_bps", &self.model.inventory_lean_bps)?,
             },
             risk: ParsedRiskConfig {
                 max_abs_position_usd: parse_decimal(
@@ -293,6 +291,7 @@ pub struct ParsedModelConfig {
     pub as_gamma: Decimal,
     pub as_kappa: Decimal,
     pub as_time_horizon: Decimal,
+    pub inventory_lean_bps: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -451,6 +450,10 @@ fn default_as_time_horizon() -> String {
     "0.5".to_string()
 }
 
+fn default_inventory_lean_bps() -> String {
+    "10.0".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub dry_run: bool,
@@ -512,6 +515,10 @@ pub struct ModelConfig {
     /// A-S inventory time horizon in hours.
     #[serde(default = "default_as_time_horizon")]
     pub as_time_horizon: String,
+    /// Additional inventory lean in bps applied at max position (pos_ratio = 1).
+    /// Shifts the reservation price by this amount linearly with pos_ratio.
+    #[serde(default = "default_inventory_lean_bps")]
+    pub inventory_lean_bps: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -583,6 +590,11 @@ pub struct PairConfig {
     pub post_only: bool,
     pub service_on: bool,
     pub side_filter: SideFilter,
+    /// Optional Binance futures stream name (lowercase base, e.g. `"resolv"` for
+    /// the `resolvusdt@markPrice@1s` stream).  When set, Binance mark prices are
+    /// streamed and injected as `MarketEvent::SpotPrice` for this symbol.
+    #[serde(default)]
+    pub binance_symbol: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -44,12 +44,12 @@ websocket_reconnect_backoff_ms = 1000
 [model]
 born_inf_bps = "5"
 born_sup_bps = "30"
-v0 = "0.3"
+v0 = "0.7"
 mu = "0.5"
 sigma = "2"
 n_points = 5
-min_step_price = "0.000001"
-min_step_volume = "1"
+min_step_price = "0.001"
+min_step_volume = "0.01"
 min_trade_amount = "5"
 position_size_skew_weight = "0.5"
 position_spread_multiplier = "1.1"
@@ -63,7 +63,7 @@ max_spread_bps = "50"
 prevent_spread_crossing = true
 cancel_orders_crossing_mid = true
 as_gamma = "0.3"
-as_kappa = "2000.0"
+as_kappa = "1000.0"
 as_time_horizon = "0.5"
 inventory_lean_bps = "10.0"
 
@@ -102,17 +102,8 @@ db_path = "data/fills-grvt-real.db"
 
 [[pairs]]
 symbol = "HYPE/USDT-P"
-enabled = false
-max_position_base = "10"
-price_source = "mark"
-post_only = true
-service_on = true
-side_filter = "both"
-
-[[pairs]]
-symbol = "PUMP/USDT-P"
 enabled = true
-max_position_base = "500000"
+max_position_base = "18"
 price_source = "mark"
 post_only = true
 service_on = true
