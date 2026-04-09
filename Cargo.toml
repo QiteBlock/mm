@@ -20,7 +20,10 @@ serde_json = "1.0"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1.48", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots", "native-tls-vendored"] }
+# native-tls as direct dep so we can build an explicit Connector::NativeTls for Binance.
+# GRVT's connect_async still defaults to rustls (rustls-tls-webpki-roots is listed first).
+native-tls = { version = "0.2", features = ["vendored"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
