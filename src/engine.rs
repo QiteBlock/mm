@@ -539,7 +539,7 @@ where
                             // uses the price we just quoted, not an older one.
                             for pair in self.config.pairs.iter().filter(|p| p.enabled) {
                                 if let Some(price) = state.market.symbols.get(&pair.symbol)
-                                    .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
+                                    .and_then(|s| s.spot_price.or(s.mark_price).or_else(|| s.mid_price()))
                                 {
                                     last_quoted_price.insert(pair.symbol.clone(), price);
                                 }
@@ -674,7 +674,7 @@ where
                     // next 100ms tick bypasses generation_min_interval_ms.
                     'price_check: for pair in self.config.pairs.iter().filter(|p| p.enabled) {
                         if let Some(new_price) = state.market.symbols.get(&pair.symbol)
-                            .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
+                            .and_then(|s| s.spot_price.or(s.mark_price).or_else(|| s.mid_price()))
                         {
                             if let Some(&old_price) = last_quoted_price.get(&pair.symbol) {
                                 if old_price > Decimal::ZERO {
@@ -813,7 +813,22 @@ where
                     .map(|bs| (p.symbol.clone(), bs.clone()))
             })
             .collect();
+        // Binance feed is independent: a GRVT disconnect must not kill it and
+        // vice versa.  Spawn it as a fire-and-forget task that writes into the
+        // same market channel.  Errors inside it are logged and reconnected
+        // internally; we never propagate them to the engine loop.
         let binance_sender = market_sender.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::binance_feed::stream_binance_spot_prices(
+                binance_symbol_map,
+                binance_sender,
+            )
+            .await
+            {
+                tracing::warn!(err = %e, "binance feed task exited unexpectedly");
+            }
+        });
+
         tokio::spawn(async move {
             tokio::try_join!(
                 exchange.stream_mark_prices(&symbols, market_sender.clone()),
@@ -822,7 +837,6 @@ where
                 exchange.stream_trades(&symbols, market_sender.clone()),
                 exchange.stream_orderbook(&symbols, market_sender),
                 exchange.stream_private_data(private_sender),
-                crate::binance_feed::stream_binance_spot_prices(binance_symbol_map, binance_sender),
             )?;
             Ok(())
         })
