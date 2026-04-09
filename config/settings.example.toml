@@ -110,14 +110,14 @@ service_on = true
 side_filter = "both"
 
 [[pairs]]
-symbol = "RESOLV/USDT-P"
+symbol = "LDO/USDT-P"
 enabled = true
-max_position_base = "20000"
+max_position_base = "2000"
 price_source = "spot"
 post_only = true
 service_on = true
 side_filter = "both"
-binance_symbol = "resolvusdt"
+binance_symbol = "ldousdt"
 
 [telegram]
 enabled = false
