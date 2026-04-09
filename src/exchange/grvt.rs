@@ -942,7 +942,7 @@ impl GrvtClient {
         >,
     ) -> Result<()> {
         let selectors = vec![self.config.grvt_sub_account_id.clone()];
-        for (id, stream) in [(201u64, "v1.fill"), (202u64, "v1.position")] {
+        for (id, stream) in [(201u64, "v1.fill"), (202u64, "v1.position"), (203u64, "v1.order")] {
             let subscribe = serde_json::to_string(&json!({
                 "jsonrpc": "2.0",
                 "method": "subscribe",
@@ -1342,6 +1342,34 @@ fn parse_grvt_open_order(value: &Value) -> Option<OpenOrder> {
     })
 }
 
+/// Convert a `v1.order` WS feed item into a `PrivateEvent`.
+/// OPEN / PARTIALLY_FILLED → UpsertOpenOrder (order is still live on book).
+/// FILLED / CANCELLED / REJECTED / anything else → RemoveOpenOrder.
+fn parse_grvt_order_event(value: &Value) -> Option<PrivateEvent> {
+    let status = value
+        .get("state")
+        .and_then(|s| s.get("status").or_else(|| s.get("s")))
+        .and_then(Value::as_str)
+        .unwrap_or("OPEN");
+    match status {
+        "OPEN" | "PARTIALLY_FILLED" => {
+            parse_grvt_open_order(value).map(PrivateEvent::UpsertOpenOrder)
+        }
+        _ => {
+            let order_id = value
+                .get("order_id")
+                .or_else(|| value.get("oi"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let nonce = value
+                .get("signature")
+                .and_then(|s| s.get("nonce").or_else(|| s.get("n")))
+                .and_then(Value::as_u64);
+            Some(PrivateEvent::RemoveOpenOrder { order_id, nonce })
+        }
+    }
+}
+
 fn parse_grvt_position(value: &Value) -> Option<Position> {
     let instrument = value
         .get("instrument")
@@ -1430,6 +1458,13 @@ fn parse_grvt_private_events(frame: &str) -> Result<Vec<PrivateEvent>> {
                 arr.iter().filter_map(parse_grvt_position).map(PrivateEvent::Position).collect()
             } else {
                 parse_grvt_position(feed).map(PrivateEvent::Position).into_iter().collect()
+            }
+        }
+        "v1.order" => {
+            if let Some(arr) = feed.as_array() {
+                arr.iter().filter_map(parse_grvt_order_event).collect()
+            } else {
+                parse_grvt_order_event(feed).into_iter().collect()
             }
         }
         _ => Vec::new(),

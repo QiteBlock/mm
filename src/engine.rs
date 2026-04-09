@@ -431,7 +431,6 @@ where
                         health.rest_failure_count(),
                         &emergency_unwind_symbols,
                     )?;
-                    last_generation_at = Some(Instant::now());
                     minute_stats.record_position_sample(&self.config, &state);
                     log_quote_competitiveness(&state, &desired);
 
@@ -527,12 +526,24 @@ where
                             state.apply_dry_run_plan(&recon.to_cancel_order_ids, &recon.to_place);
                             log_dry_run_inventory(&state);
                             log_dry_run_orders(&recon.to_place);
+                            last_generation_at = Some(Instant::now());
                         } else {
+                            // Set last_generation_at before the await so any ticker ticks
+                            // that fire during cancel/place are blocked by the cooldown guard.
+                            last_generation_at = Some(Instant::now());
                             // Cancel all existing orders atomically, then place new ones.
                             // A single cancel_all is cheaper and guarantees no stale orders
                             // survive (individual cancel+place races can leave orphans).
                             self.exchange.cancel_all_orders().await?;
+                            // Clear local open-order state immediately so the next
+                            // reconcile cycle doesn't see stale OPEN orders and
+                            // generate wrong sizes while waiting for WS CANCELLED events.
+                            state.open_orders.clear();
                             self.exchange.place_orders(recon.to_place.clone()).await?;
+                            // Reset the cooldown timestamp again now that placement is done,
+                            // so generation_min_interval_ms is measured from placement
+                            // completion rather than start.
+                            last_generation_at = Some(Instant::now());
                             // Update last quoted price so the 3bps move detector
                             // uses the price we just quoted, not an older one.
                             for pair in self.config.pairs.iter().filter(|p| p.enabled) {
@@ -543,6 +554,10 @@ where
                                 }
                             }
                         }
+                    } else {
+                        // No order changes needed; reset cooldown so we don't
+                        // re-enter the generation block on every 100ms tick.
+                        last_generation_at = Some(Instant::now());
                     }
                 }
                 _ = toxicity_ticker.tick() => {

@@ -13,19 +13,19 @@ use crate::domain::MarketEvent;
 const BINANCE_FUTURES_WS_BASE: &str = "wss://fstream.binance.com/stream";
 const RECONNECT_DELAY_SECS: u64 = 2;
 
-/// Stream Binance perpetual futures best-bid/ask (bookTicker) and re-emit as
+/// Stream Binance perpetual futures mark prices (`markPrice@1s`) and re-emit as
 /// `MarketEvent::SpotPrice` for the corresponding GRVT symbol.
 ///
 /// `symbol_map` maps GRVT symbol names (e.g. `"RESOLV/USDT-P"`) to the
 /// Binance futures symbol (e.g. `"resolvusdt"`).
 ///
-/// `bookTicker` fires on every BBO change (sub-millisecond, event-driven).
-/// Mid-price is computed as (bid+ask)/2 locally.
+/// `markPrice@1s` fires every second regardless of market activity — correct
+/// for illiquid pairs where `bookTicker` may not fire at all.
 ///
 /// Ping frames from Binance are answered with Pong to prevent the 3-minute
 /// idle disconnect.  Events are sent with `try_send` so a full channel never
 /// blocks the WS read loop.  The read loop drains all buffered frames and
-/// keeps only the latest price per symbol (LIFO collapse) before forwarding.
+/// keeps only the latest price per symbol before forwarding.
 pub async fn stream_binance_spot_prices(
     symbol_map: HashMap<String, String>,
     sender: mpsc::Sender<MarketEvent>,
@@ -35,22 +35,22 @@ pub async fn stream_binance_spot_prices(
         return Ok(());
     }
 
-    // Build the Binance combined-stream URL using bookTicker (real-time BBO).
+    // markPrice@1s: fires every second unconditionally.
     let streams: Vec<String> = symbol_map
         .values()
-        .map(|s| format!("{}@bookTicker", s.to_lowercase()))
+        .map(|s| format!("{}@markPrice@1s", s.to_lowercase()))
         .collect();
     let url = format!("{}?streams={}", BINANCE_FUTURES_WS_BASE, streams.join("/"));
 
     // Reverse map: binance_symbol_lowercase -> grvt symbol.
-    // Envelope stream field looks like "resolvusdt@bookTicker"; split at '@' → "resolvusdt".
+    // Envelope stream field looks like "resolvusdt@markPrice"; split at '@' → "resolvusdt".
     let reverse_map: HashMap<String, String> = symbol_map
         .iter()
         .map(|(grvt, binance)| (binance.to_lowercase(), grvt.clone()))
         .collect();
 
     loop {
-        info!(%url, "connecting to Binance futures bookTicker stream");
+        info!(%url, "connecting to Binance futures markPrice@1s stream");
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
                 let (mut write, mut read) = ws_stream.split();
@@ -68,27 +68,24 @@ pub async fn stream_binance_spot_prices(
                         }
                     };
 
-                    // LIFO drain: collect the first frame plus any already-buffered frames.
-                    // Keep only the latest mid-price per symbol to avoid replaying stale data.
+                    // Drain: collect all already-buffered frames, keep only
+                    // the latest price per symbol.
                     let mut latest: HashMap<String, Decimal> = HashMap::new();
                     let mut needs_reconnect = false;
                     let mut pong_payload: Option<Vec<u8>> = None;
 
                     process_frame(first, &reverse_map, &mut latest, &mut needs_reconnect, &mut pong_payload);
 
-                    // Drain any additional buffered frames without blocking.
                     loop {
                         match tokio::time::timeout(Duration::ZERO, read.next()).await {
                             Ok(Some(Ok(frame))) => {
                                 process_frame(frame, &reverse_map, &mut latest, &mut needs_reconnect, &mut pong_payload);
                             }
-                            // Timeout (no more buffered) or stream end: drain complete.
                             _ => break,
                         }
                     }
 
-                    // Respond to Ping. Binance sends a Ping every ~3 minutes;
-                    // failure to respond causes a disconnect.
+                    // Respond to Ping — Binance disconnects after ~3 min without Pong.
                     if let Some(payload) = pong_payload {
                         if let Err(e) = write.send(WsMessage::Pong(payload)).await {
                             warn!(err = %e, "failed to send Pong; reconnecting");
@@ -100,9 +97,6 @@ pub async fn stream_binance_spot_prices(
                         break;
                     }
 
-                    // Forward only the freshest price per symbol.
-                    // try_send never blocks — drops if channel is full, which is fine because
-                    // a newer event arrives momentarily and the engine deduplicates anyway.
                     let now = chrono::Utc::now();
                     for (grvt_symbol, price) in latest {
                         let _ = sender.try_send(MarketEvent::SpotPrice {
@@ -130,12 +124,11 @@ fn process_frame(
 ) {
     match frame {
         WsMessage::Text(text) => {
-            if let Some((sym, price)) = parse_book_ticker(&text, reverse_map) {
+            if let Some((sym, price)) = parse_mark_price(&text, reverse_map) {
                 latest.insert(sym, price);
             }
         }
         WsMessage::Ping(payload) => {
-            // Always take the latest ping payload; one Pong reply is enough.
             *pong_payload = Some(payload.to_vec());
         }
         WsMessage::Close(_) => {
@@ -146,31 +139,28 @@ fn process_frame(
     }
 }
 
-/// Parse a Binance bookTicker combined-stream envelope into (grvt_symbol, mid_price).
-fn parse_book_ticker(text: &str, reverse_map: &HashMap<String, String>) -> Option<(String, Decimal)> {
+/// Parse a Binance markPrice combined-stream envelope into (grvt_symbol, mark_price).
+fn parse_mark_price(text: &str, reverse_map: &HashMap<String, String>) -> Option<(String, Decimal)> {
     let envelope: BinanceEnvelope = serde_json::from_str(text).ok()?;
-    // "resolvusdt@bookTicker" → "resolvusdt"
+    // "resolvusdt@markPrice" → "resolvusdt"
     let prefix = envelope.stream.split('@').next()?;
     let grvt_symbol = reverse_map.get(prefix)?.clone();
-    let bid = Decimal::from_str(&envelope.data.best_bid).ok()?;
-    let ask = Decimal::from_str(&envelope.data.best_ask).ok()?;
-    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask < bid {
+    let price = Decimal::from_str(&envelope.data.mark_price).ok()?;
+    if price <= Decimal::ZERO {
         return None;
     }
-    let mid = (bid + ask) / Decimal::TWO;
-    Some((grvt_symbol, mid))
+    Some((grvt_symbol, price))
 }
 
 #[derive(Deserialize)]
 struct BinanceEnvelope {
     stream: String,
-    data: BinanceBookTickerData,
+    data: BinanceMarkPriceData,
 }
 
 #[derive(Deserialize)]
-struct BinanceBookTickerData {
-    #[serde(rename = "b")]
-    best_bid: String,
-    #[serde(rename = "a")]
-    best_ask: String,
+struct BinanceMarkPriceData {
+    /// Mark price as a decimal string.
+    #[serde(rename = "p")]
+    mark_price: String,
 }
