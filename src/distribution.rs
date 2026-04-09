@@ -1,0 +1,236 @@
+use rust_decimal::{Decimal, MathematicalOps};
+use tracing::info;
+
+use crate::{
+    config::{ModelConfig, PairConfig, ParsedConfig, SideFilter},
+    domain::{FactorSnapshot, QuoteIntent, Side},
+    fill_analytics::FillTracker,
+};
+
+/// Generate quote intents for one symbol.
+///
+/// Pricing uses the Avellaneda-Stoikov model:
+///   reservation price r = mid - q·γ·σ²·T
+///   optimal spread     δ = γ·σ²·T + (2/γ)·ln(1 + γ/κ)
+///
+/// where q is the normalised inventory position (pos_ratio), σ is realised
+/// volatility from factors, T is the configured time horizon in hours, γ is
+/// risk-aversion, and κ is the market-order arrival rate proxy.
+///
+/// The A-S bid/ask give a dynamic minimum spread that widens automatically
+/// with volatility.  Level 0 is additionally clamped to be no worse than the
+/// live BBO (S1 anchor), and deeper levels step away from that anchor.
+pub fn generate_quotes(
+    model: &ModelConfig,
+    parsed: &ParsedConfig,
+    pair: &PairConfig,
+    factors: &FactorSnapshot,
+    fill_tracker: &FillTracker,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+    pos_ratio: Decimal,
+) -> Vec<QuoteIntent> {
+    if !pair.service_on || pair.side_filter == SideFilter::None || model.n_points == 0 {
+        return Vec::new();
+    }
+
+    let v0 = parsed.model.v0;
+    let mu = parsed.model.mu;
+    let gauss_sigma = parsed.model.sigma.max(Decimal::new(1, 6));
+    let dead_zone = parsed.model.position_dead_zone.abs();
+    let spread_multiplier = parsed.model.position_spread_multiplier;
+    let fee_floor_bps =
+        (parsed.venue.maker_fee_rate + parsed.venue.taker_fee_rate) * Decimal::from(10_000u64);
+
+    // A-S parameters
+    let gamma = parsed.model.as_gamma.max(Decimal::new(1, 6));
+    let kappa = parsed.model.as_kappa.max(Decimal::new(1, 6));
+    // Time horizon in hours.
+    let time_horizon = parsed.model.as_time_horizon.max(Decimal::new(1, 6));
+
+    // Annualise σ: raw_volatility is per-cycle log-return std dev (EWMA).
+    // At 1s reconcile interval there are 3600 cycles/hour; σ_hour = σ_cycle * sqrt(3600) = σ_cycle * 60.
+    // Using sqrt(3600) = 60 in integer arithmetic.
+    let vol_per_cycle = factors.raw_volatility.max(parsed.factors.volatility_floor);
+    let cycles_per_hour = Decimal::from(3600u64); // 1s cycles; adjust if reconcile_interval changes
+    let vol_per_hour = vol_per_cycle * cycles_per_hour.sqrt().unwrap_or(Decimal::from(60u64));
+
+    // A-S: γ·σ_hour²·T
+    let gamma_sigma2_t = gamma * vol_per_hour * vol_per_hour * time_horizon;
+
+    // A-S optimal half-spread in price fraction:
+    //   δ/2 = (γ·σ²·T)/2 + (1/γ)·ln(1 + γ/κ)
+    // κ is calibrated in price-fraction space. Default κ=1.5 → ln(1+0.05/1.5)/0.05 ≈ 3.2bps
+    // — a meaningful minimum that reacts to vol.
+    let ln_term = {
+        let arg = Decimal::ONE + gamma / kappa;
+        arg.ln()
+    };
+    let as_half_spread_frac_raw = gamma_sigma2_t / Decimal::TWO + ln_term / gamma;
+
+    // Clamp to [fee_floor/2, max_spread/2] in bps, then convert back to fraction for pricing.
+    let as_half_spread_bps = (as_half_spread_frac_raw * Decimal::from(10_000u64))
+        .max(fee_floor_bps / Decimal::TWO)
+        .min(parsed.model.max_spread_bps / Decimal::TWO);
+    // Use the clamped fraction for all price calculations.
+    let as_half_spread_frac = as_half_spread_bps / Decimal::from(10_000u64);
+
+    // A-S reservation price: mid shifted by inventory * risk aversion * variance * horizon.
+    // The shift is in price units; pos_ratio ∈ [-1, 1] so shift is bounded by γ·σ²·T·mid.
+    let mid = factors.price_index;
+    let as_reservation_price = mid - pos_ratio * gamma_sigma2_t * mid;
+
+    // S6: volume_imbalance is purely a size scalar (>= 0).
+    let volume_factor = (Decimal::ONE + factors.volume_imbalance).max(Decimal::ZERO);
+
+    let position_signal = if factors.inventory_skew.abs() < dead_zone {
+        Decimal::ZERO
+    } else {
+        factors.inventory_skew
+    };
+    // Cap at 3× so the accumulating side never gets pushed more than 3× spread away from mid.
+    let bid_skew = (Decimal::ONE + position_signal * spread_multiplier)
+        .max(Decimal::ZERO)
+        .min(Decimal::new(3, 0));
+    let ask_skew = (Decimal::ONE - position_signal * spread_multiplier)
+        .max(Decimal::ZERO)
+        .min(Decimal::new(3, 0));
+
+    // S5: Continuous regime scaling.
+    let intensity = factors.regime_intensity;
+    let regime_spread_multiplier = Decimal::new(9, 1) + Decimal::new(9, 1) * intensity;
+    let regime_size_multiplier = Decimal::new(12, 1) - Decimal::new(8, 1) * intensity;
+
+    // S4: signed flow direction for toxic-flow detection.
+    let flow_dir = factors.flow_direction;
+    let toxic_reduction =
+        (Decimal::ONE - Decimal::new(6, 1) * flow_dir.abs()).max(Decimal::new(4, 1));
+    let safe_boost =
+        (Decimal::ONE + Decimal::new(3, 1) * flow_dir.abs()).min(Decimal::new(15, 1));
+
+    // Level spacing always uses born_inf/sup_bps so the grid is independent of A-S.
+    // A-S only sets the anchor price at level 0; deeper levels step from that anchor.
+    // Enforce a minimum 2 bps step so levels don't cluster together.
+    let min_step_bps = Decimal::TWO;
+    let step = if model.n_points <= 1 {
+        Decimal::ZERO
+    } else {
+        let raw_step = (parsed.model.born_sup_bps - parsed.model.born_inf_bps)
+            / Decimal::from((model.n_points - 1) as u64);
+        raw_step.max(min_step_bps)
+    };
+
+    // A-S bid/ask from reservation price.
+    let as_bid = as_reservation_price * (Decimal::ONE - as_half_spread_frac * bid_skew);
+    let as_ask = as_reservation_price * (Decimal::ONE + as_half_spread_frac * ask_skew);
+
+    // S1: Level 0 anchors to BBO, but no worse than A-S theoretical price.
+    // If live BBO exists, use it clamped to A-S. If no BBO, fall back to A-S.
+    let anchor_bid = match best_bid {
+        Some(bb) => bb.min(as_bid),   // join or improve A-S — never worse than A-S
+        None => as_bid,
+    };
+    let anchor_ask = match best_ask {
+        Some(ba) => ba.max(as_ask),   // join or improve A-S — never worse than A-S
+        None => as_ask,
+    };
+
+    info!(
+        symbol = %pair.symbol,
+        mid = %mid,
+        vol_per_cycle = %vol_per_cycle,
+        vol_per_hour = %vol_per_hour,
+        gamma_sigma2_t = %gamma_sigma2_t,
+        as_half_spread_bps = %as_half_spread_bps,
+        reservation_price = %as_reservation_price,
+        reservation_shift_bps = %(pos_ratio * gamma_sigma2_t * Decimal::from(10_000u64)),
+        as_bid = %as_bid,
+        as_ask = %as_ask,
+        anchor_bid = %anchor_bid,
+        anchor_ask = %anchor_ask,
+        pos_ratio = %pos_ratio,
+        regime_intensity = %factors.regime_intensity,
+        "AS pricing"
+    );
+
+    // S2+P3: size asymmetry: inventory + flow direction.
+    let size_skew_weight = parsed.model.position_size_skew_weight;
+    let size_skew = (pos_ratio - flow_dir * Decimal::new(5, 1)) * size_skew_weight;
+    let bid_size_skew = (Decimal::ONE - size_skew).max(Decimal::new(2, 1));
+    let ask_size_skew = (Decimal::ONE + size_skew).max(Decimal::new(2, 1));
+
+    let mut quotes = Vec::with_capacity(model.n_points * 2);
+    for level in 0..model.n_points {
+        let level_decimal = Decimal::from(level as u64);
+
+        // Spread for this level: independent grid from born_inf to born_sup.
+        let unclamped_bps = (parsed.model.born_inf_bps + step * level_decimal)
+            .max(fee_floor_bps)
+            * regime_spread_multiplier;
+        let level_spread_bps = unclamped_bps.min(parsed.model.max_spread_bps);
+        let level_half_spread_frac = level_spread_bps / Decimal::from(20_000u64); // half-spread
+
+        // S1: Level 0 anchors to BBO (clamped to A-S); deeper levels step from anchor.
+        let (bid_price, ask_price) = if level == 0 {
+            (anchor_bid, anchor_ask)
+        } else {
+            let bid_spread = level_half_spread_frac * Decimal::TWO * bid_skew;
+            let ask_spread = level_half_spread_frac * Decimal::TWO * ask_skew;
+            (
+                anchor_bid * (Decimal::ONE - bid_spread),
+                anchor_ask * (Decimal::ONE + ask_spread),
+            )
+        };
+
+        let weight = gaussian(level_decimal, mu, gauss_sigma);
+        let base_size = (weight * v0 * volume_factor * regime_size_multiplier).max(Decimal::ZERO);
+        let bid_fill_multiplier =
+            fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, level);
+        let ask_fill_multiplier =
+            fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, level);
+
+        let mut bid_size = (base_size * bid_fill_multiplier * bid_size_skew).max(Decimal::ZERO);
+        let mut ask_size = (base_size * ask_fill_multiplier * ask_size_skew).max(Decimal::ZERO);
+
+        // S4: graduated toxic-flow sided reduction / safe-side boost.
+        if flow_dir > Decimal::ZERO {
+            ask_size *= toxic_reduction;
+            bid_size *= safe_boost;
+        } else if flow_dir < Decimal::ZERO {
+            bid_size *= toxic_reduction;
+            ask_size *= safe_boost;
+        }
+
+        if matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly) {
+            quotes.push(QuoteIntent {
+                symbol: pair.symbol.clone(),
+                level_index: level,
+                side: Side::Bid,
+                price: bid_price,
+                quantity: bid_size,
+                post_only: pair.post_only,
+            });
+        }
+        if matches!(pair.side_filter, SideFilter::Both | SideFilter::AskOnly) {
+            quotes.push(QuoteIntent {
+                symbol: pair.symbol.clone(),
+                level_index: level,
+                side: Side::Ask,
+                price: ask_price,
+                quantity: ask_size,
+                post_only: pair.post_only,
+            });
+        }
+    }
+
+    quotes
+}
+
+pub fn factor_spread_addon(parsed: &ParsedConfig, volatility: Decimal) -> Decimal {
+    volatility * parsed.factors.volatility_spread_weight
+}
+
+fn gaussian(x: Decimal, mu: Decimal, sigma: Decimal) -> Decimal {
+    let exponent = -((x - mu) * (x - mu)) / (Decimal::from(2u64) * sigma * sigma);
+    exponent.exp()
+}

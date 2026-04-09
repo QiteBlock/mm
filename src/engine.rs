@@ -1,0 +1,1780 @@
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use rust_decimal::Decimal;
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{interval, Duration, Instant},
+};
+use tracing::{debug, info, warn};
+
+use crate::{
+    account_cleanup::{flatten_account_state, CleanupExchange},
+    config::{AppConfig, ParsedConfig},
+    control::RuntimeControl,
+    distribution::generate_quotes,
+    domain::{Fill, InstrumentMeta, MarketEvent, OrderRequest, OrderType, PrivateEvent, Side},
+    exchange::ExchangeClient,
+    factors::FactorEngine,
+    fill_analytics::FillTracker,
+    risk::{proportional_vol_widening, run_security_checks, CircuitBreaker},
+    state::BotState,
+    storage::FillStore,
+    telegram::TelegramNotifier,
+};
+
+pub struct MarketMakingEngine<E> {
+    config: AppConfig,
+    parsed: ParsedConfig,
+    exchange: Arc<E>,
+    notifier: TelegramNotifier,
+    fill_store: Arc<Option<FillStore>>,
+    control: Arc<RuntimeControl>,
+}
+
+#[derive(Default)]
+struct MinuteStats {
+    trade_count: usize,
+    fills_count: usize,
+    simulated_fills_count: usize,
+    missed_crosses_count: usize,
+    near_misses_count: usize,
+    position_sample_count: usize,
+    signed_position_sum: Decimal,
+    /// Accumulated spread_earned_bps across all fills this minute.
+    spread_earned_bps_sum: Decimal,
+    /// Accumulated fill notional (qty * price) for spread-earned averaging.
+    fill_notional_sum: Decimal,
+    /// Number of fills where adverse selection > spread earned (toxic fills).
+    toxic_fill_count: usize,
+}
+
+impl MinuteStats {
+    fn record_position_sample(&mut self, config: &AppConfig, state: &BotState) {
+        let signed_position: Decimal = config
+            .pairs
+            .iter()
+            .filter(|pair| pair.enabled)
+            .map(|pair| {
+                state
+                    .positions
+                    .get(&pair.symbol)
+                    .map(|position| position.quantity)
+                    .unwrap_or(Decimal::ZERO)
+            })
+            .sum();
+        self.position_sample_count += 1;
+        self.signed_position_sum += signed_position;
+    }
+
+    fn accumulate_fill(&mut self, fs: FillStats) {
+        if !fs.is_simulated {
+            self.fills_count += 1;
+        } else {
+            self.fills_count += 1;
+            self.simulated_fills_count += 1;
+        }
+        self.spread_earned_bps_sum += fs.spread_earned_bps * fs.notional;
+        self.fill_notional_sum += fs.notional;
+        if fs.is_toxic {
+            self.toxic_fill_count += 1;
+        }
+    }
+}
+
+struct FillStats {
+    spread_earned_bps: Decimal,
+    notional: Decimal,
+    is_toxic: bool,
+    is_simulated: bool,
+}
+
+#[derive(Default)]
+struct HealthTracker {
+    ws_discrepancies: VecDeque<Instant>,
+    rest_failures: VecDeque<Instant>,
+    /// Consecutive quoting cycles that produced zero orders while a position is held.
+    consecutive_empty_cycles: usize,
+    /// Per-symbol count of cycles where the position exceeded the emergency threshold
+    /// but the unwind side produced zero orders.
+    empty_unwind_cycles: HashMap<String, usize>,
+}
+
+impl HealthTracker {
+    fn record_ws_discrepancy(&mut self) {
+        self.ws_discrepancies.push_back(Instant::now());
+        self.prune();
+    }
+
+    fn record_rest_failure(&mut self) {
+        self.rest_failures.push_back(Instant::now());
+        self.prune();
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.ws_discrepancies.len() >= 3 || self.rest_failures.len() >= 2
+    }
+
+    fn ws_discrepancy_count(&self) -> usize {
+        self.ws_discrepancies.len()
+    }
+
+    fn rest_failure_count(&self) -> usize {
+        self.rest_failures.len()
+    }
+
+    /// Update global empty-quote counter. Returns true if the alert threshold was just crossed.
+    fn update_empty_cycles(&mut self, orders_generated: usize, has_position: bool, threshold: usize) -> bool {
+        if orders_generated == 0 && has_position {
+            self.consecutive_empty_cycles += 1;
+            self.consecutive_empty_cycles == threshold
+        } else {
+            self.consecutive_empty_cycles = 0;
+            false
+        }
+    }
+
+    /// Update per-symbol empty-unwind counter. Returns true when emergency unwind should activate.
+    fn update_unwind_cycles(&mut self, symbol: &str, unwind_orders: usize, over_threshold: bool, emergency_cycles: usize) -> bool {
+        if unwind_orders == 0 && over_threshold {
+            let count = self.empty_unwind_cycles.entry(symbol.to_string()).or_insert(0);
+            *count += 1;
+            *count >= emergency_cycles
+        } else {
+            self.empty_unwind_cycles.remove(symbol);
+            false
+        }
+    }
+
+    fn prune(&mut self) {
+        let horizon = Duration::from_secs(120);
+        while self
+            .ws_discrepancies
+            .front()
+            .map(|instant| instant.elapsed() > horizon)
+            .unwrap_or(false)
+        {
+            self.ws_discrepancies.pop_front();
+        }
+        while self
+            .rest_failures
+            .front()
+            .map(|instant| instant.elapsed() > horizon)
+            .unwrap_or(false)
+        {
+            self.rest_failures.pop_front();
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReconResult {
+    unexpected_orders: usize,
+    missing_orders: usize,
+}
+
+struct ReconciliationPlan {
+    to_cancel_order_ids: Vec<String>,
+    to_place: Vec<OrderRequest>,
+    changed_orders: usize,
+    result: ReconResult,
+}
+
+impl ReconciliationPlan {
+    fn should_update(&self) -> bool {
+        !self.to_cancel_order_ids.is_empty() || !self.to_place.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct GroupDiff {
+    to_cancel_order_ids: Vec<String>,
+    to_place: Vec<OrderRequest>,
+    changed_count: usize,
+    unexpected_orders: usize,
+    missing_orders: usize,
+}
+
+impl<E> MarketMakingEngine<E>
+where
+    E: ExchangeClient + CleanupExchange + 'static,
+{
+    pub fn new(
+        config: AppConfig,
+        exchange: Arc<E>,
+        notifier: TelegramNotifier,
+        fill_store: Arc<Option<FillStore>>,
+        control: Arc<RuntimeControl>,
+    ) -> Self {
+        let parsed = config
+            .parsed()
+            .expect("validated config should always produce a parsed config");
+        Self {
+            config,
+            parsed,
+            exchange,
+            notifier,
+            fill_store,
+            control,
+        }
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        let instruments = self.exchange.load_instruments().await?;
+        let instrument_by_symbol: HashMap<String, InstrumentMeta> = instruments
+            .into_iter()
+            .map(|instrument| (instrument.symbol.clone(), instrument))
+            .collect();
+
+        let market_symbols: Vec<String> = self
+            .config
+            .pairs
+            .iter()
+            .filter(|pair| pair.enabled)
+            .map(|pair| pair.symbol.clone())
+            .collect();
+
+        let initial_orders = self.exchange.fetch_open_orders().await?;
+        let (market_tx, mut market_rx) = mpsc::channel(1024);
+        let (private_tx, mut private_rx) = mpsc::channel(512);
+        let mut streams_task =
+            self.spawn_all_streams(market_symbols.clone(), market_tx, private_tx);
+        let mut state = BotState::new(
+            self.parsed.venue.maker_fee_rate,
+            self.parsed.runtime.max_orderbook_depth,
+        );
+        state.apply_private_event(PrivateEvent::OpenOrders(initial_orders));
+        if self.config.runtime.dry_run && self.config.runtime.restore_dry_run_state {
+            if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+                let restored_positions = fill_store.load_latest_positions(true)?;
+                let restored_count = restored_positions.len();
+                for position in restored_positions {
+                    state.apply_private_event(PrivateEvent::Position(position));
+                }
+                if restored_count > 0 {
+                    info!(restored_count, "restored dry-run positions from fill store");
+                }
+            }
+        } else if self.config.runtime.dry_run {
+            info!("dry-run state restore disabled; starting from a clean baseline");
+        }
+
+        if self.config.runtime.dry_run {
+            info!("dry-run mode active; order submission and cancel requests are disabled");
+        }
+
+        let mut factors = FactorEngine::default();
+        let mut fill_tracker = FillTracker::default();
+        let mut health = HealthTracker::default();
+        let mut circuit_breaker = CircuitBreaker::new(
+            self.parsed.risk.circuit_breaker_cooldown_ms,
+            self.parsed.risk.circuit_breaker_cooldown_ms * 8,
+            self.parsed.risk.circuit_breaker_cooldown_ms * 4,
+        );
+        let mut ticker = interval(Duration::from_millis(
+            self.config.runtime.reconcile_interval_ms,
+        ));
+        let mut stats_ticker = interval(Duration::from_secs(60));
+        let mut toxicity_ticker = {
+            let mut t = interval(Duration::from_secs(5));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        };
+        let mut last_generation_at: Option<Instant> = None;
+        let mut last_open_order_sync_at: Option<Instant> = None;
+        let mut last_breaker_message: Option<String> = None;
+        let mut minute_stats = MinuteStats::default();
+
+        loop {
+            tokio::select! {
+                biased;
+                maybe_private = private_rx.recv() => {
+                    let event = maybe_private.context("private stream disconnected")?;
+                    if matches!(event, PrivateEvent::StreamReconnected) {
+                        health.record_ws_discrepancy();
+                    }
+                    self.apply_private_event_and_record(
+                        &mut state,
+                        event,
+                        false,
+                        &mut fill_tracker,
+                        &mut minute_stats,
+                    ).await?;
+                }
+                _ = ticker.tick() => {
+                    if should_resync_open_orders(
+                        last_open_order_sync_at,
+                        self.config.runtime.reconcile_interval_ms,
+                    ) {
+                        match self.exchange.fetch_open_orders().await {
+                            Ok(exchange_orders) => {
+                                state.apply_private_event(PrivateEvent::OpenOrders(exchange_orders));
+                                last_open_order_sync_at = Some(Instant::now());
+                            }
+                            Err(err) => {
+                                health.record_rest_failure();
+                                return Err(err);
+                            }
+                        }
+                    }
+
+                    if let Some(last_generation_at) = last_generation_at {
+                        if last_generation_at.elapsed()
+                            < Duration::from_millis(self.config.runtime.generation_min_interval_ms)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if matches!(
+                        last_breaker_message.as_deref(),
+                        Some(message) if message.contains("open order count limit breached")
+                    ) && state.open_orders.len() <= self.config.risk.max_open_orders
+                    {
+                        circuit_breaker.force_reset();
+                        info!(
+                            open_orders = state.open_orders.len(),
+                            max_open_orders = self.config.risk.max_open_orders,
+                            "reset open-order circuit breaker after count normalized"
+                        );
+                        last_breaker_message = None;
+                    }
+
+                    // Fix 4: REST fallback when WS market data has gone stale.
+                    // Attempt one REST fetch per symbol before the security check trips
+                    // the circuit breaker — avoids false-positive staleness outages.
+                    {
+                        let stale_after_ms = self.config.runtime.stale_market_data_ms;
+                        let is_stale = state.market.last_updated.map_or(false, |ts| {
+                            (Utc::now() - ts).num_milliseconds() > stale_after_ms
+                        });
+                        if is_stale {
+                            warn!("market data stale; attempting REST snapshot fallback");
+                            let snapshot = self.exchange.fetch_market_snapshot(&market_symbols).await;
+                            if !snapshot.is_empty() {
+                                info!(events = snapshot.len(), "REST snapshot refreshed stale market data");
+                                for event in snapshot {
+                                    state.apply_market_event(event);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Err(err) = run_security_checks(&self.config, &self.parsed, &state) {
+                        circuit_breaker.trip(err.to_string());
+                    } else {
+                        circuit_breaker.reset();
+                    }
+
+                    if let Err(err) = circuit_breaker.ensure_closed() {
+                        warn!(?err, "risk gate rejected quoting cycle");
+                        let breaker_message = format!("{err:#}");
+                        let suppress_cold_start_alert = state.market.last_updated.is_none()
+                            && breaker_message.contains("no market data available yet");
+                        let should_handle_trip = last_breaker_message.as_deref()
+                            != Some(breaker_message.as_str());
+                        if !self.config.runtime.dry_run && should_handle_trip {
+                            if should_flatten_on_breaker(&breaker_message) {
+                                flatten_account_state(
+                                    self.exchange.as_ref(),
+                                    &self.notifier,
+                                    "circuit-breaker",
+                                ).await?;
+                                let exchange_orders = self.exchange.fetch_open_orders().await?;
+                                state.apply_private_event(PrivateEvent::OpenOrders(exchange_orders));
+                                state.positions.clear();
+                                state.refresh_after_external_position_reset();
+                                for position in self.exchange.fetch_positions().await? {
+                                    state.apply_private_event(PrivateEvent::Position(position));
+                                }
+                            } else {
+                                self.exchange.cancel_all_orders().await?;
+                            }
+                        }
+                        if !suppress_cold_start_alert && should_handle_trip {
+                            self.notifier
+                                .send(format!("circuit breaker engaged: {breaker_message}"))
+                                .await;
+                        }
+                        last_breaker_message = Some(breaker_message);
+                        continue;
+                    }
+                    last_breaker_message = None;
+                    info!(
+                        market_symbols = state.market.symbols.len(),
+                        open_orders = state.open_orders.len(),
+                        dry_run_orders = state.dry_run_orders.len(),
+                        "risk checks passed; building desired orders"
+                    );
+
+                    if self.control.is_paused() {
+                        continue;
+                    }
+
+                    let degraded = health.is_degraded();
+
+                    // Build the set of symbols in emergency-unwind mode before generating
+                    // orders so the generator can relax the min_trade_amount for those symbols.
+                    let emergency_unwind_symbols: HashSet<String> = self
+                        .config
+                        .pairs
+                        .iter()
+                        .filter(|pair| pair.enabled)
+                        .filter_map(|pair| {
+                            let cycles = health.empty_unwind_cycles.get(&pair.symbol).copied().unwrap_or(0);
+                            if cycles >= self.parsed.risk.emergency_unwind_cycles {
+                                Some(pair.symbol.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let desired = self.build_desired_orders(
+                        &mut factors,
+                        &state,
+                        &instrument_by_symbol,
+                        &fill_tracker,
+                        degraded,
+                        health.ws_discrepancy_count(),
+                        health.rest_failure_count(),
+                        &emergency_unwind_symbols,
+                    )?;
+                    last_generation_at = Some(Instant::now());
+                    minute_stats.record_position_sample(&self.config, &state);
+                    log_quote_competitiveness(&state, &desired);
+
+                    // Fix 1: alert when the bot stops quoting while holding a position.
+                    {
+                        let has_position = state
+                            .positions
+                            .values()
+                            .any(|p| p.quantity != Decimal::ZERO);
+                        let alert_cycles = self.config.runtime.empty_quote_alert_cycles;
+                        if health.update_empty_cycles(desired.len(), has_position, alert_cycles) {
+                            let positions_desc: String = state
+                                .positions
+                                .values()
+                                .filter(|p| p.quantity != Decimal::ZERO)
+                                .map(|p| format!("{} {}", p.symbol, p.quantity))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            warn!(
+                                consecutive_cycles = alert_cycles,
+                                positions = %positions_desc,
+                                "bot generated zero orders while holding position"
+                            );
+                            self.notifier
+                                .send(format!(
+                                    "WARNING: bot generated 0 orders for {} consecutive cycles while holding positions: {}",
+                                    alert_cycles, positions_desc,
+                                ))
+                                .await;
+                        }
+                    }
+
+                    // Fix 3: update per-symbol emergency-unwind counters.
+                    for pair in self.config.pairs.iter().filter(|p| p.enabled) {
+                        let position = state
+                            .positions
+                            .get(&pair.symbol)
+                            .map(|p| p.quantity)
+                            .unwrap_or(Decimal::ZERO);
+                        let parsed_pair = self.parsed.pairs.iter().find(|p| p.symbol == pair.symbol);
+                        if let Some(parsed_pair) = parsed_pair {
+                            let threshold = self.parsed.risk.emergency_unwind_threshold * parsed_pair.max_position_base;
+                            let over_threshold = position.abs() > threshold;
+                            let unwind_side = if position > Decimal::ZERO { Side::Ask } else { Side::Bid };
+                            let unwind_orders = desired
+                                .iter()
+                                .filter(|o| o.symbol == pair.symbol && o.side == unwind_side)
+                                .count();
+                            let was_inactive = health.update_unwind_cycles(
+                                &pair.symbol,
+                                unwind_orders,
+                                over_threshold,
+                                self.parsed.risk.emergency_unwind_cycles,
+                            );
+                            if was_inactive {
+                                warn!(
+                                    symbol = %pair.symbol,
+                                    position = %position,
+                                    cycles = self.parsed.risk.emergency_unwind_cycles,
+                                    "emergency unwind mode activated"
+                                );
+                                self.notifier
+                                    .send(format!(
+                                        "EMERGENCY UNWIND: {} position {} stuck for {} cycles; relaxing min trade amount",
+                                        pair.symbol, position, self.parsed.risk.emergency_unwind_cycles,
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+
+                    let current_orders = if self.config.runtime.dry_run {
+                        &state.dry_run_orders
+                    } else {
+                        &state.open_orders
+                    };
+                    let recon = build_reconciliation_plan(
+                        &self.parsed,
+                        &state,
+                        current_orders,
+                        &desired,
+                    )?;
+                    if recon.should_update() {
+                        info!(
+                            changed_orders = recon.changed_orders,
+                            unexpected_orders = recon.result.unexpected_orders,
+                            missing_orders = recon.result.missing_orders,
+                            cancel_count = recon.to_cancel_order_ids.len(),
+                            place_count = recon.to_place.len(),
+                            "reconciling desired orders against exchange"
+                        );
+                        if self.config.runtime.dry_run {
+                            state.apply_dry_run_plan(&recon.to_cancel_order_ids, &recon.to_place);
+                            log_dry_run_inventory(&state);
+                            log_dry_run_orders(&recon.to_place);
+                        } else {
+                            self.exchange.cancel_orders(recon.to_cancel_order_ids.clone()).await?;
+                            self.exchange.place_orders(recon.to_place.clone()).await?;
+                            let exchange_orders = self.exchange.fetch_open_orders().await?;
+                            state.apply_private_event(PrivateEvent::OpenOrders(exchange_orders));
+                            last_open_order_sync_at = Some(Instant::now());
+                        }
+                    }
+                }
+                _ = toxicity_ticker.tick() => {
+                    // Periodically push the last known price into the fill_tracker so
+                    // toxicity observations don't stall when the market WS goes quiet.
+                    let now = Utc::now();
+                    for pair in self.config.pairs.iter().filter(|p| p.enabled) {
+                        if let Some(price) = state.market.symbols.get(&pair.symbol)
+                            .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
+                        {
+                            fill_tracker.observe_price(&pair.symbol, price, now);
+                        }
+                    }
+                    fill_tracker.decay(now);
+                }
+                _ = stats_ticker.tick() => {
+                    if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+                        fill_store.insert_global_pnl_snapshot(
+                            Utc::now().to_rfc3339(),
+                            &state,
+                            self.config.runtime.dry_run,
+                            None,
+                            None,
+                        )?;
+                    }
+                    log_minute_stats(&self.config, &state, &minute_stats);
+                    minute_stats = MinuteStats::default();
+                }
+                result = &mut streams_task => {
+                    result.context("stream task join failed")??;
+                    let err = anyhow::anyhow!("market/private streams stopped unexpectedly");
+                    self.notifier.send(format!("{err:#}")).await;
+                    return Err(err);
+                }
+                maybe_market = market_rx.recv() => {
+                    let event = maybe_market.context("market stream disconnected")?;
+                    if matches!(event, MarketEvent::Trade { .. }) {
+                        minute_stats.trade_count += 1;
+                    }
+                    if matches!(event, MarketEvent::StreamReconnected { .. }) {
+                        health.record_ws_discrepancy();
+                    }
+                    state.apply_market_event(event.clone());
+                    if state.market.last_updated.is_some()
+                        && matches!(
+                            last_breaker_message.as_deref(),
+                            Some(message)
+                                if message.contains("no market data available yet")
+                                    || message.contains("market data stale for")
+                        )
+                    {
+                        circuit_breaker.force_reset();
+                        last_breaker_message = None;
+                        info!("reset market-data circuit breaker after fresh market data");
+                    }
+                    if let Some((symbol, reference_price, timestamp)) = market_reference(&state, &event) {
+                        fill_tracker.observe_price(&symbol, reference_price, timestamp);
+                    }
+                    fill_tracker.decay(Utc::now());
+                    if self.config.runtime.dry_run {
+                        if let MarketEvent::Trade {
+                              symbol,
+                              price,
+                              quantity,
+                              taker_side,
+                              timestamp,
+                              ..
+                          } = event
+                            {
+                                let simulated_fills =
+                                    state.simulate_dry_run_trade(&symbol, price, quantity, timestamp);
+                                let (missed_cross, near_miss) = log_missed_fill_opportunity(
+                                    &state,
+                                    &symbol,
+                                    price,
+                                  quantity,
+                                  taker_side,
+                                    timestamp,
+                                    &simulated_fills,
+                                );
+                                if missed_cross {
+                                    minute_stats.missed_crosses_count += 1;
+                                }
+                                if near_miss {
+                                    minute_stats.near_misses_count += 1;
+                                }
+                                for fill in simulated_fills {
+                                    let fs = self.apply_fill_and_record(
+                                        &mut state,
+                                        fill,
+                                        true,
+                                        &mut fill_tracker,
+                                    ).await?;
+                                    minute_stats.accumulate_fill(fs);
+                                }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn apply_private_event_and_record(
+        &self,
+        state: &mut BotState,
+        event: PrivateEvent,
+        force_simulated: bool,
+        fill_tracker: &mut FillTracker,
+        minute_stats: &mut MinuteStats,
+    ) -> Result<()> {
+        match event {
+            PrivateEvent::Fill(fill) => {
+                let fs = self
+                    .apply_fill_and_record(state, fill, force_simulated, fill_tracker)
+                    .await?;
+                minute_stats.accumulate_fill(fs);
+                Ok(())
+            }
+            other => {
+                state.apply_private_event(other);
+                Ok(())
+            }
+        }
+    }
+
+    async fn apply_fill_and_record(
+        &self,
+        state: &mut BotState,
+        fill: Fill,
+        is_simulated: bool,
+        fill_tracker: &mut FillTracker,
+    ) -> Result<FillStats> {
+        let (level_index, spread_earned_bps) = infer_fill_analytics(state, &fill);
+        fill_tracker.record_fill(
+            fill.symbol.clone(),
+            fill.side,
+            level_index,
+            fill.price,
+            spread_earned_bps,
+            fill.timestamp,
+        );
+        let toxicity_score = fill_tracker.toxicity_score(&fill.symbol, fill.side, level_index);
+        let next_level_multiplier =
+            fill_tracker.level_volume_multiplier(&fill.symbol, fill.side, level_index);
+
+        state.apply_private_event(PrivateEvent::Fill(fill.clone()));
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_fill(&fill, state, is_simulated)?;
+        }
+
+        let position = state.positions.get(&fill.symbol);
+        let position_quantity = position
+            .map(|position| position.quantity)
+            .unwrap_or(Decimal::ZERO);
+        let realized_pnl = position
+            .map(|position| position.realized_pnl)
+            .unwrap_or(Decimal::ZERO);
+        let unrealized_pnl = position
+            .map(|position| position.unrealized_pnl)
+            .unwrap_or(Decimal::ZERO);
+
+        info!(
+            symbol = %fill.symbol,
+            side = ?fill.side,
+            level_index,
+            price = %fill.price,
+            quantity = %fill.quantity,
+            spread_earned_bps = %spread_earned_bps,
+            toxicity_score = %toxicity_score,
+            next_level_multiplier = %next_level_multiplier,
+            is_simulated,
+            position_quantity = %position_quantity,
+            realized_pnl = %realized_pnl,
+            unrealized_pnl = %unrealized_pnl,
+            total_fees = %state.pnl.total_fees,
+            total_pnl = %state.pnl.total_pnl,
+            "fill recorded"
+        );
+
+        let fill_kind = if is_simulated { "simulated" } else { "live" };
+        self.notifier
+            .send(format!(
+                "{fill_kind} fill\nsymbol: {}\nside: {:?}\nlevel: {}\nprice: {}\nquantity: {}\nposition: {}\nrealized pnl: {}\nunrealized pnl: {}\nfees: {}\ntotal pnl: {}",
+                fill.symbol,
+                fill.side,
+                level_index,
+                fill.price,
+                fill.quantity,
+                position_quantity,
+                realized_pnl,
+                unrealized_pnl,
+                state.pnl.total_fees,
+                state.pnl.total_pnl,
+            ))
+            .await;
+        Ok(FillStats {
+            spread_earned_bps,
+            notional: fill.quantity * fill.price,
+            is_toxic: toxicity_score > Decimal::ONE, // ratio > 1 means adverse move > spread
+            is_simulated,
+        })
+    }
+
+    fn spawn_all_streams(
+        &self,
+        symbols: Vec<String>,
+        market_sender: mpsc::Sender<MarketEvent>,
+        private_sender: mpsc::Sender<PrivateEvent>,
+    ) -> JoinHandle<Result<()>> {
+        let exchange = self.exchange.clone();
+        tokio::spawn(async move {
+            tokio::try_join!(
+                exchange.stream_mark_prices(&symbols, market_sender.clone()),
+                exchange.stream_spot_prices(&symbols, market_sender.clone()),
+                exchange.stream_best_bid_ask(&symbols, market_sender.clone()),
+                exchange.stream_trades(&symbols, market_sender.clone()),
+                exchange.stream_orderbook(&symbols, market_sender),
+                exchange.stream_private_data(private_sender),
+            )?;
+            Ok(())
+        })
+    }
+
+    fn build_desired_orders(
+        &self,
+        factors: &mut FactorEngine,
+        state: &BotState,
+        instrument_by_symbol: &HashMap<String, InstrumentMeta>,
+        fill_tracker: &FillTracker,
+        degraded: bool,
+        ws_discrepancies: usize,
+        rest_failures: usize,
+        emergency_unwind_symbols: &HashSet<String>,
+    ) -> Result<Vec<OrderRequest>> {
+        let mut orders = Vec::new();
+        let vol_cut = self.parsed.model.volatility_cut_threshold;
+        let min_trade_amount = self.parsed.model.min_trade_amount;
+        let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
+
+        for pair in self.config.pairs.iter().filter(|pair| pair.enabled) {
+            let Some(mut factor_snapshot) =
+                factors.compute(&self.config, &self.parsed, pair, state)
+            else {
+                info!(symbol = %pair.symbol, "factor snapshot unavailable; skipping symbol");
+                continue;
+            };
+
+            if factor_snapshot.recent_trade_count < n_trade_threshold {
+                continue;
+            }
+            if factor_snapshot.raw_volatility > vol_cut {
+                warn!(
+                    symbol = %pair.symbol,
+                    raw_volatility = %factor_snapshot.raw_volatility,
+                    threshold = %vol_cut,
+                    "volatility cut threshold exceeded; suppressing quotes"
+                );
+                continue;
+            }
+
+            factor_snapshot.volatility += emergency_widening_bps(&self.parsed, state, pair);
+            if degraded {
+                let utilization = if self.parsed.risk.max_abs_position_usd.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    state.total_abs_position_notional() / self.parsed.risk.max_abs_position_usd
+                };
+                factor_snapshot.volatility +=
+                    proportional_vol_widening(factor_snapshot.raw_volatility, utilization);
+            }
+
+            info!(
+                symbol = %pair.symbol,
+                regime = ?factor_snapshot.regime,
+                regime_intensity = %factor_snapshot.regime_intensity,
+                raw_volatility = %factor_snapshot.raw_volatility,
+                spread_addon = %factor_snapshot.volatility,
+                volume_imbalance = %factor_snapshot.volume_imbalance,
+                flow_direction = %factor_snapshot.flow_direction,
+                inventory_skew = %factor_snapshot.inventory_skew,
+                recent_trade_count = factor_snapshot.recent_trade_count,
+                degraded,
+                ws_discrepancies,
+                rest_failures,
+                bid_lvl0_multiplier = %fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0),
+                ask_lvl0_multiplier = %fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, 0),
+                "factor snapshot"
+            );
+
+            let instrument = instrument_by_symbol
+                .get(&pair.symbol)
+                .with_context(|| format!("missing instrument metadata for {}", pair.symbol))?;
+            let market = state.market.symbols.get(&pair.symbol);
+            let best_bid = market.and_then(|market| market.best_bid);
+            let best_ask = market.and_then(|market| market.best_ask);
+            let mid = market.and_then(|market| market.mid_price());
+            let reference_price = mid.or(best_bid).or(best_ask).unwrap_or(Decimal::ZERO);
+            let parsed_pair = self
+                .parsed
+                .pairs
+                .iter()
+                .find(|parsed_pair| parsed_pair.symbol == pair.symbol)
+                .with_context(|| format!("missing parsed pair config for {}", pair.symbol))?;
+            let current_position = state
+                .positions
+                .get(&pair.symbol)
+                .map(|position| position.quantity)
+                .unwrap_or(Decimal::ZERO);
+            // Compute pos_ratio for size asymmetry (S2) before generating quotes.
+            let pos_ratio = if parsed_pair.max_position_base.is_zero() {
+                Decimal::ZERO
+            } else {
+                (current_position / parsed_pair.max_position_base)
+                    .clamp(-Decimal::ONE, Decimal::ONE)
+            };
+
+            let quotes = generate_quotes(
+                &self.config.model,
+                &self.parsed,
+                pair,
+                &factor_snapshot,
+                fill_tracker,
+                best_bid,
+                best_ask,
+                pos_ratio,
+            );
+
+            // A-S prices from generate_quotes are already final — no tick improvement override.
+
+            let mut remaining_bid_capacity = live_side_capacity_base(
+                &self.parsed,
+                parsed_pair,
+                current_position,
+                state.total_abs_position_notional(),
+                reference_price,
+                Side::Bid,
+            );
+            let mut remaining_ask_capacity = live_side_capacity_base(
+                &self.parsed,
+                parsed_pair,
+                current_position,
+                state.total_abs_position_notional(),
+                reference_price,
+                Side::Ask,
+            );
+            // Fix 2/3: is this side an unwind (closing) side given current position?
+            // True when selling into a long or buying into a short.
+            // Fix 3: in emergency-unwind mode, relax the min-trade-amount floor to the
+            // absolute instrument minimum so the position can always be unwound.
+            let emergency_unwind = emergency_unwind_symbols.contains(&pair.symbol);
+            // Effective min-trade-amount: use 0 in emergency so any sized order passes.
+            let effective_min_trade_amount = if emergency_unwind {
+                Decimal::ZERO
+            } else {
+                min_trade_amount
+            };
+
+            let mut symbol_orders = Vec::new();
+
+            for quote in quotes
+                .into_iter()
+                .filter(|quote| quote.quantity > Decimal::ZERO)
+            {
+                // Fix 2: determine if this specific quote is on the unwind side.
+                let is_unwind = match quote.side {
+                    Side::Ask => current_position > Decimal::ZERO,
+                    Side::Bid => current_position < Decimal::ZERO,
+                };
+                let quote_min_trade_amount = if is_unwind {
+                    effective_min_trade_amount
+                } else {
+                    min_trade_amount
+                };
+
+                let mut price =
+                    round_to_tick_for_side(quote.price, instrument.tick_size, quote.side);
+                let mut quantity = quote.quantity;
+                if degraded {
+                    quantity *= Decimal::new(7, 1);
+                }
+                // Level 0 anchors to the BBO — skip the index buffer push so the BBO
+                // anchor set in distribution.rs is not overridden by a 2-bps min gap.
+                // Deeper levels still need the buffer to avoid crossing the index.
+                let apply_index_buffer = quote.level_index > 0;
+                if apply_index_buffer {
+                    if let Some(mid) = mid {
+                        price = push_outside_index_buffer(
+                            &self.parsed,
+                            price,
+                            quote.side,
+                            mid,
+                            instrument.tick_size,
+                        );
+                    }
+                }
+                if self.config.model.prevent_spread_crossing {
+                    price =
+                        clip_to_bbo(price, quote.side, best_bid, best_ask, instrument.tick_size);
+                }
+
+                // Fix 2: for the unwind side, floor quantity to min_trade_amount/price
+                // so skew-reduced sizes never disappear below the notional floor.
+                let effective_quantity = quantize_order_quantity_for_checks(quantity, instrument);
+                if effective_quantity <= Decimal::ZERO {
+                    continue;
+                }
+                if effective_quantity * price < quote_min_trade_amount {
+                    if is_unwind && price > Decimal::ZERO {
+                        // Floor to the minimum notional; the position MUST be quoted.
+                        quantity = (quote_min_trade_amount / price).max(Decimal::new(1, 9));
+                        // re-quantize; if still zero the instrument step is too large — skip
+                        let floored = quantize_order_quantity_for_checks(quantity, instrument);
+                        if floored <= Decimal::ZERO {
+                            continue;
+                        }
+                        quantity = floored;
+                    } else {
+                        continue;
+                    }
+                }
+
+                if !self.config.runtime.dry_run {
+                    let remaining_capacity = match quote.side {
+                        Side::Bid => &mut remaining_bid_capacity,
+                        Side::Ask => &mut remaining_ask_capacity,
+                    };
+                    if *remaining_capacity <= Decimal::ZERO {
+                        continue;
+                    }
+                    if quantity > *remaining_capacity {
+                        quantity = *remaining_capacity;
+                    }
+                    let effective_quantity =
+                        quantize_order_quantity_for_checks(quantity, instrument);
+                    if effective_quantity <= Decimal::ZERO
+                        || effective_quantity * price < quote_min_trade_amount
+                    {
+                        // Fix 2: floor rather than skip for unwind side.
+                        if is_unwind && price > Decimal::ZERO {
+                            let floored_qty = quantize_order_quantity_for_checks(
+                                (quote_min_trade_amount / price).max(Decimal::new(1, 9)),
+                                instrument,
+                            );
+                            if floored_qty > Decimal::ZERO && floored_qty <= *remaining_capacity {
+                                quantity = floored_qty;
+                            } else {
+                                info!(
+                                    symbol = %pair.symbol,
+                                    side = ?quote.side,
+                                    raw_quantity = %quantity,
+                                    price = %price,
+                                    "skipping unwind quote: floored quantity exceeds remaining capacity"
+                                );
+                                continue;
+                            }
+                        } else {
+                            info!(
+                                symbol = %pair.symbol,
+                                side = ?quote.side,
+                                raw_quantity = %quantity,
+                                effective_quantity = %effective_quantity,
+                                price = %price,
+                                min_trade_amount = %min_trade_amount,
+                                "skipping live quote below minimum notional after venue quantization"
+                            );
+                            continue;
+                        }
+                    }
+                    *remaining_capacity -= quantity;
+                    info!(
+                        symbol = %pair.symbol,
+                        side = ?quote.side,
+                        capped_quantity = %quantity,
+                        remaining_side_capacity = %remaining_capacity,
+                        reference_price = %reference_price,
+                        current_position = %current_position,
+                        "applied live risk size clamp"
+                    );
+                }
+
+                let request = OrderRequest {
+                    symbol: quote.symbol,
+                    contract_id: instrument.contract_id,
+                    level_index: quote.level_index,
+                    side: quote.side,
+                    order_type: OrderType::Limit,
+                    price: Some(price),
+                    quantity,
+                    post_only: quote.post_only,
+                };
+                symbol_orders.push(request.clone());
+                orders.push(request);
+            }
+
+            if symbol_orders.is_empty() && current_position != Decimal::ZERO {
+                warn!(
+                    symbol = %pair.symbol,
+                    position = %current_position,
+                    emergency_unwind,
+                    "zero orders generated for symbol while holding a non-zero position"
+                );
+            }
+            log_symbol_quote_plan(&pair.symbol, &symbol_orders);
+        }
+
+        Ok(orders)
+    }
+}
+
+fn round_to_tick_for_side(price: Decimal, tick_size: Option<Decimal>, side: Side) -> Decimal {
+    let Some(tick) = tick_size else {
+        return price.round_dp(6);
+    };
+    if tick.is_zero() {
+        return price.round_dp(6);
+    }
+    let scaled = price / tick;
+    match side {
+        Side::Bid => scaled.floor() * tick,
+        Side::Ask => scaled.ceil() * tick,
+    }
+}
+
+fn quantize_order_quantity_for_checks(
+    quantity: Decimal,
+    instrument: &InstrumentMeta,
+) -> Decimal {
+    if quantity <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let decimal_step = Decimal::new(1, instrument.underlying_decimals.min(28));
+    let step = instrument.min_order_size.max(decimal_step);
+    if step <= Decimal::ZERO {
+        return quantity;
+    }
+
+    let aligned = (quantity / step).floor() * step;
+    if aligned > Decimal::ZERO && aligned < step {
+        step.normalize()
+    } else {
+        aligned.normalize()
+    }
+}
+
+fn clip_to_bbo(
+    price: Decimal,
+    side: Side,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+    tick_size: Option<Decimal>,
+) -> Decimal {
+    match side {
+        Side::Bid => {
+            if let Some(ask) = best_ask {
+                let clipped = (ask - tick_size.unwrap_or(Decimal::new(1, 6))).max(Decimal::ZERO);
+                return price.min(clipped);
+            }
+        }
+        Side::Ask => {
+            if let Some(bid) = best_bid {
+                return price.max(bid + tick_size.unwrap_or(Decimal::new(1, 6)));
+            }
+        }
+    }
+    price
+}
+
+fn push_outside_index_buffer(
+    parsed: &ParsedConfig,
+    price: Decimal,
+    side: Side,
+    mid: Decimal,
+    tick_size: Option<Decimal>,
+) -> Decimal {
+    let buffer = parsed.model.index_forward_buffer_bps / Decimal::from(10_000u64);
+    match side {
+        Side::Bid => {
+            let max_bid = mid * (Decimal::ONE - buffer);
+            round_to_tick_for_side(price.min(max_bid), tick_size, side)
+        }
+        Side::Ask => {
+            let min_ask = mid * (Decimal::ONE + buffer);
+            round_to_tick_for_side(price.max(min_ask), tick_size, side)
+        }
+    }
+}
+
+fn crosses_index_with_buffer(
+    parsed: &ParsedConfig,
+    price: Decimal,
+    side: Side,
+    mid: Decimal,
+) -> bool {
+    let buffer = parsed.model.index_forward_buffer_bps / Decimal::from(10_000u64);
+    match side {
+        Side::Bid => price >= mid * (Decimal::ONE - buffer),
+        Side::Ask => price <= mid * (Decimal::ONE + buffer),
+    }
+}
+
+fn log_quote_competitiveness(state: &BotState, desired: &[OrderRequest]) {
+    let mut top_by_symbol: HashMap<&str, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
+    for order in desired.iter().filter(|order| order.level_index == 0) {
+        let entry = top_by_symbol
+            .entry(order.symbol.as_str())
+            .or_insert((None, None));
+        match (order.side, order.price) {
+            (Side::Bid, Some(price)) => {
+                entry.0 = Some(entry.0.map_or(price, |current| current.max(price)));
+            }
+            (Side::Ask, Some(price)) => {
+                entry.1 = Some(entry.1.map_or(price, |current| current.min(price)));
+            }
+            _ => {}
+        }
+    }
+
+    for (symbol, (our_bid, our_ask)) in top_by_symbol {
+        let Some(market) = state.market.symbols.get(symbol) else {
+            continue;
+        };
+        let best_bid = market.best_bid;
+        let best_ask = market.best_ask;
+        let bid_gap_bps = match (best_bid, our_bid) {
+            (Some(best), Some(ours)) if !best.is_zero() => {
+                Some((best - ours) / best * Decimal::from(10_000u64))
+            }
+            _ => None,
+        };
+        let ask_gap_bps = match (best_ask, our_ask) {
+            (Some(best), Some(ours)) if !best.is_zero() => {
+                Some((ours - best) / best * Decimal::from(10_000u64))
+            }
+            _ => None,
+        };
+
+        info!(
+            symbol,
+            best_bid = ?best_bid,
+            our_bid = ?our_bid,
+            bid_gap_bps = ?bid_gap_bps,
+            best_ask = ?best_ask,
+            our_ask = ?our_ask,
+            ask_gap_bps = ?ask_gap_bps,
+            "quote competitiveness"
+        );
+    }
+}
+
+fn build_reconciliation_plan(
+    parsed: &ParsedConfig,
+    state: &BotState,
+    current_orders_source: &HashMap<String, crate::domain::OpenOrder>,
+    desired: &[OrderRequest],
+) -> Result<ReconciliationPlan> {
+    let price_floor = parsed.model.min_step_price;
+    let volume_floor = parsed.model.min_step_volume;
+    let price_threshold = parsed.model.price_sensitivity_threshold;
+    let price_scaling = parsed.model.price_sensitivity_scaling_factor;
+    let volume_threshold = parsed.model.volume_sensitivity_threshold;
+
+    // fills_since_recon suppression removed: the fill_tracker toxicity score already
+    // reduces size at adversely-selected levels, and suppressing by (symbol, side, level)
+    // prevented legitimate replacement orders after fills.
+    let desired: Vec<OrderRequest> = desired.to_vec();
+
+    let mut changed_orders = 0;
+    let mut to_cancel_order_ids = Vec::new();
+    let mut to_place = Vec::new();
+    let mut result = ReconResult::default();
+
+    let mut desired_by_symbol_side: HashMap<(String, Side), Vec<&OrderRequest>> = HashMap::new();
+    for order in &desired {
+        desired_by_symbol_side
+            .entry((order.symbol.clone(), order.side))
+            .or_default()
+            .push(order);
+    }
+    for orders in desired_by_symbol_side.values_mut() {
+        orders.sort_by_key(|order| order.level_index);
+    }
+
+    let mut current_by_symbol_side: HashMap<(String, Side), Vec<&crate::domain::OpenOrder>> =
+        HashMap::new();
+    for order in current_orders_source.values() {
+        current_by_symbol_side
+            .entry((order.symbol.clone(), order.side))
+            .or_default()
+            .push(order);
+    }
+    for ((_, side), orders) in current_by_symbol_side.iter_mut() {
+        orders.sort_by(|left, right| {
+            let left_price = left.price.unwrap_or(Decimal::ZERO);
+            let right_price = right.price.unwrap_or(Decimal::ZERO);
+            match side {
+                Side::Bid => right_price.cmp(&left_price),
+                Side::Ask => left_price.cmp(&right_price),
+            }
+        });
+    }
+
+    let crossing_mid_exists = current_orders_source.values().any(|order| {
+        let Some(market) = state.market.symbols.get(&order.symbol) else {
+            return false;
+        };
+        let Some(mid) = market.mid_price() else {
+            return false;
+        };
+        let Some(price) = order.price else {
+            return false;
+        };
+        crosses_index_with_buffer(parsed, price, order.side, mid)
+    });
+
+    for (key, target_orders) in &desired_by_symbol_side {
+        let current_orders = current_by_symbol_side.get(key).cloned().unwrap_or_default();
+        let diff = diff_group(
+            &current_orders,
+            target_orders,
+            price_floor,
+            volume_floor,
+            price_threshold,
+            price_scaling,
+            volume_threshold,
+        );
+        changed_orders += diff.changed_count;
+        result.unexpected_orders += diff.unexpected_orders;
+        result.missing_orders += diff.missing_orders;
+        to_cancel_order_ids.extend(diff.to_cancel_order_ids);
+        to_place.extend(diff.to_place);
+    }
+
+    for (key, current_orders) in &current_by_symbol_side {
+        if !desired_by_symbol_side.contains_key(key) {
+            changed_orders += current_orders.len();
+            result.unexpected_orders += current_orders.len();
+            to_cancel_order_ids.extend(
+                current_orders
+                    .iter()
+                    .filter_map(|order| order.order_id.clone()),
+            );
+        }
+    }
+
+    if crossing_mid_exists {
+        for order in current_orders_source.values() {
+            let Some(market) = state.market.symbols.get(&order.symbol) else {
+                continue;
+            };
+            let Some(mid) = market.mid_price() else {
+                continue;
+            };
+            let Some(price) = order.price else {
+                continue;
+            };
+            if crosses_index_with_buffer(parsed, price, order.side, mid) {
+                if let Some(order_id) = order.order_id.clone() {
+                    to_cancel_order_ids.push(order_id);
+                }
+            }
+        }
+    }
+    to_cancel_order_ids.sort_unstable();
+    to_cancel_order_ids.dedup();
+
+    Ok(ReconciliationPlan {
+        to_cancel_order_ids,
+        to_place,
+        changed_orders,
+        result,
+    })
+}
+
+fn log_dry_run_inventory(state: &BotState) {
+    for position in state
+        .positions
+        .values()
+        .filter(|position| !position.quantity.is_zero())
+    {
+        info!(
+            symbol = %position.symbol,
+            quantity = %position.quantity,
+            entry_price = %position.entry_price,
+            realized_pnl = %position.realized_pnl,
+            unrealized_pnl = %position.unrealized_pnl,
+            total_fees = %state.pnl.total_fees,
+            total_pnl = %state.pnl.total_pnl,
+            "dry-run inventory"
+        );
+    }
+}
+
+fn log_minute_stats(config: &AppConfig, state: &BotState, stats: &MinuteStats) {
+    let average_position = if stats.position_sample_count == 0 {
+        Decimal::ZERO
+    } else {
+        stats.signed_position_sum / Decimal::from(stats.position_sample_count as u64)
+    };
+    let realized_pnl: Decimal = config
+        .pairs
+        .iter()
+        .filter(|pair| pair.enabled)
+        .map(|pair| {
+            state
+                .positions
+                .get(&pair.symbol)
+                .map(|position| position.realized_pnl)
+                .unwrap_or(Decimal::ZERO)
+        })
+        .sum();
+    let unrealized_pnl: Decimal = config
+        .pairs
+        .iter()
+        .filter(|pair| pair.enabled)
+        .map(|pair| {
+            state
+                .positions
+                .get(&pair.symbol)
+                .map(|position| position.unrealized_pnl)
+                .unwrap_or(Decimal::ZERO)
+        })
+        .sum();
+
+    // Notional-weighted average spread earned across all live fills this minute.
+    let live_fills = stats.fills_count.saturating_sub(stats.simulated_fills_count);
+    let avg_spread_earned_bps = if stats.fill_notional_sum > Decimal::ZERO {
+        (stats.spread_earned_bps_sum / stats.fill_notional_sum)
+            .round_dp(2)
+    } else {
+        Decimal::ZERO
+    };
+    // Toxic fill ratio: fraction of fills where adverse selection exceeded spread.
+    let toxic_fill_ratio = if live_fills > 0 {
+        Decimal::from(stats.toxic_fill_count) / Decimal::from(live_fills as u64)
+    } else {
+        Decimal::ZERO
+    };
+    // Simple profitability signal: positive when spread > adverse selection on average.
+    let profitability_signal = if live_fills > 0 {
+        // avg_spread_earned_bps > 1 and low toxicity = healthy; < 1 or high toxicity = bad.
+        avg_spread_earned_bps - toxic_fill_ratio * Decimal::from(10u64)
+    } else {
+        Decimal::ZERO
+    };
+
+    info!(
+        trade_count = stats.trade_count,
+        fills_count = stats.fills_count,
+        simulated_fills_count = stats.simulated_fills_count,
+        live_fills_count = live_fills,
+        missed_crosses_count = stats.missed_crosses_count,
+        near_misses_count = stats.near_misses_count,
+        average_position = %average_position,
+        realized_pnl = %realized_pnl,
+        unrealized_pnl = %unrealized_pnl,
+        total_fees = %state.pnl.total_fees,
+        total_pnl = %state.pnl.total_pnl,
+        avg_spread_earned_bps = %avg_spread_earned_bps,
+        toxic_fill_ratio = %toxic_fill_ratio,
+        toxic_fill_count = stats.toxic_fill_count,
+        profitability_signal = %profitability_signal,
+        "minute stats"
+    );
+}
+
+fn log_symbol_quote_plan(symbol: &str, orders: &[OrderRequest]) {
+    let bid_count = orders
+        .iter()
+        .filter(|order| order.side == Side::Bid)
+        .count();
+    let ask_count = orders
+        .iter()
+        .filter(|order| order.side == Side::Ask)
+        .count();
+    let total_bid_qty: Decimal = orders
+        .iter()
+        .filter(|order| order.side == Side::Bid)
+        .map(|order| order.quantity)
+        .sum();
+    let total_ask_qty: Decimal = orders
+        .iter()
+        .filter(|order| order.side == Side::Ask)
+        .map(|order| order.quantity)
+        .sum();
+    let top_bid = orders
+        .iter()
+        .filter(|order| order.side == Side::Bid)
+        .filter_map(|order| order.price)
+        .max();
+    let top_ask = orders
+        .iter()
+        .filter(|order| order.side == Side::Ask)
+        .filter_map(|order| order.price)
+        .min();
+    info!(
+        symbol = %symbol,
+        bid_count,
+        ask_count,
+        total_bid_qty = %total_bid_qty,
+        total_ask_qty = %total_ask_qty,
+        top_bid = ?top_bid,
+        top_ask = ?top_ask,
+        "quote plan summary"
+    );
+}
+
+fn log_missed_fill_opportunity(
+    state: &BotState,
+    symbol: &str,
+    trade_price: Decimal,
+    trade_quantity: Decimal,
+    taker_side: Option<Side>,
+    timestamp: chrono::DateTime<Utc>,
+    simulated_fills: &[Fill],
+) -> (bool, bool) {
+    if !simulated_fills.is_empty() {
+        return (false, false);
+    }
+
+    let top_bid = state
+        .dry_run_orders
+        .values()
+        .filter(|order| order.symbol == symbol && order.side == Side::Bid)
+        .filter_map(|order| order.price)
+        .max();
+    let top_ask = state
+        .dry_run_orders
+        .values()
+        .filter(|order| order.symbol == symbol && order.side == Side::Ask)
+        .filter_map(|order| order.price)
+        .min();
+
+    let crossed_bid = top_bid.map(|bid| trade_price <= bid).unwrap_or(false);
+    let crossed_ask = top_ask.map(|ask| trade_price >= ask).unwrap_or(false);
+
+    let one_bp = Decimal::new(1, 0);
+    let near_bid_bps = top_bid.and_then(|bid| {
+        if bid.is_zero() {
+            None
+        } else {
+            Some(((bid - trade_price).abs() / bid) * Decimal::from(10_000u64))
+        }
+    });
+    let near_ask_bps = top_ask.and_then(|ask| {
+        if ask.is_zero() {
+            None
+        } else {
+            Some(((trade_price - ask).abs() / ask) * Decimal::from(10_000u64))
+        }
+    });
+
+    if crossed_bid || crossed_ask {
+        warn!(
+            symbol = %symbol,
+            trade_price = %trade_price,
+            trade_quantity = %trade_quantity,
+            taker_side = ?taker_side,
+            timestamp = %timestamp,
+            top_bid = ?top_bid,
+            top_ask = ?top_ask,
+            crossed_bid,
+            crossed_ask,
+            "trade crossed resting dry-run quote without simulated fill"
+        );
+        (true, false)
+    } else if near_bid_bps.map(|bps| bps <= one_bp).unwrap_or(false)
+        || near_ask_bps.map(|bps| bps <= one_bp).unwrap_or(false)
+    {
+        debug!(
+            symbol = %symbol,
+            trade_price = %trade_price,
+            trade_quantity = %trade_quantity,
+            taker_side = ?taker_side,
+            timestamp = %timestamp,
+            top_bid = ?top_bid,
+            top_ask = ?top_ask,
+            near_bid_bps = ?near_bid_bps,
+            near_ask_bps = ?near_ask_bps,
+            "trade approached top dry-run quote without simulated fill"
+        );
+        (false, true)
+    } else {
+        (false, false)
+    }
+}
+
+fn should_resync_open_orders(last_sync_at: Option<Instant>, reconcile_interval_ms: u64) -> bool {
+    let Some(last_sync_at) = last_sync_at else {
+        return true;
+    };
+    last_sync_at.elapsed() >= Duration::from_millis(reconcile_interval_ms.saturating_mul(5))
+}
+
+fn should_flatten_on_breaker(message: &str) -> bool {
+    message.contains("drawdown limit breached")
+        || message.contains("global position limit breached")
+        || message.contains("symbol position limit breached")
+        || message.contains("correlated position limit breached")
+}
+
+fn emergency_widening_bps(
+    parsed: &ParsedConfig,
+    state: &BotState,
+    pair: &crate::config::PairConfig,
+) -> Decimal {
+    if parsed.risk.max_symbol_position_usd.is_zero() || parsed.risk.emergency_widening_bps.is_zero()
+    {
+        return Decimal::ZERO;
+    }
+
+    let Some(position) = state.positions.get(&pair.symbol) else {
+        return Decimal::ZERO;
+    };
+    let Some(market) = state.market.symbols.get(&pair.symbol) else {
+        return Decimal::ZERO;
+    };
+    let Some(reference_price) = market.mark_price.or_else(|| market.mid_price()) else {
+        return Decimal::ZERO;
+    };
+
+    let utilization = ((position.quantity * reference_price).abs()
+        / parsed.risk.max_symbol_position_usd)
+        .min(Decimal::ONE);
+    if utilization < parsed.risk.emergency_skew_start {
+        return Decimal::ZERO;
+    }
+    parsed.risk.emergency_widening_bps
+        * utilization
+        * parsed.risk.emergency_skew_max.max(Decimal::ONE)
+}
+
+fn live_side_capacity_base(
+    parsed: &ParsedConfig,
+    pair: &crate::config::ParsedPairConfig,
+    current_position: Decimal,
+    total_abs_position_notional: Decimal,
+    reference_price: Decimal,
+    side: Side,
+) -> Decimal {
+    // Fix 2: the unwind (close) side reduces existing exposure, so USD position
+    // limits must NOT block it — applying them here causes the "death spiral"
+    // where a full position has zero ask capacity and can never unwind.
+    let is_unwind = match side {
+        Side::Ask => current_position > Decimal::ZERO, // long → selling reduces position
+        Side::Bid => current_position < Decimal::ZERO, // short → buying reduces position
+    };
+    if is_unwind {
+        // Can close at most abs(position), bounded by max_position_base.
+        return current_position.abs().min(pair.max_position_base).max(Decimal::ZERO);
+    }
+
+    // Accumulation side: apply the full USD + pair position limits.
+    let pair_capacity = match side {
+        Side::Bid => {
+            (pair.max_position_base - current_position.max(Decimal::ZERO)).max(Decimal::ZERO)
+        }
+        Side::Ask => {
+            (pair.max_position_base - (-current_position).max(Decimal::ZERO)).max(Decimal::ZERO)
+        }
+    };
+
+    if reference_price <= Decimal::ZERO {
+        return pair_capacity;
+    }
+
+    let symbol_position_notional = (current_position * reference_price).abs();
+    let symbol_usd_capacity = (parsed.risk.max_symbol_position_usd - symbol_position_notional)
+        .max(Decimal::ZERO)
+        / reference_price;
+    let global_usd_capacity = (parsed.risk.max_abs_position_usd - total_abs_position_notional)
+        .max(Decimal::ZERO)
+        / reference_price;
+
+    pair_capacity
+        .min(symbol_usd_capacity.max(Decimal::ZERO))
+        .min(global_usd_capacity.max(Decimal::ZERO))
+        .max(Decimal::ZERO)
+}
+
+fn diff_group(
+    current: &[&crate::domain::OpenOrder],
+    target: &[&OrderRequest],
+    price_floor: Decimal,
+    volume_floor: Decimal,
+    price_threshold: Decimal,
+    price_scaling: Decimal,
+    volume_threshold: Decimal,
+) -> GroupDiff {
+    let max_len = current.len().max(target.len());
+    let mut diff = GroupDiff::default();
+
+    for idx in 0..max_len {
+        let Some(target_order) = target.get(idx) else {
+            diff.changed_count += current.len().saturating_sub(idx);
+            diff.unexpected_orders += current.len().saturating_sub(idx);
+            diff.to_cancel_order_ids.extend(
+                current
+                    .iter()
+                    .skip(idx)
+                    .filter_map(|order| order.order_id.clone()),
+            );
+            break;
+        };
+        let Some(current_order) = current.get(idx) else {
+            diff.changed_count += target.len().saturating_sub(idx);
+            diff.missing_orders += target.len().saturating_sub(idx);
+            diff.to_place
+                .extend(target.iter().skip(idx).map(|order| (*order).clone()));
+            break;
+        };
+
+        let level_scale = Decimal::ONE + price_scaling * Decimal::from(idx as u64);
+        let current_price = current_order.price.unwrap_or(Decimal::ZERO);
+        let target_price = target_order.price.unwrap_or(Decimal::ZERO);
+        let price_delta = (current_price - target_price).abs();
+        let volume_delta = (current_order.remaining_quantity - target_order.quantity).abs();
+
+        let price_limit = price_floor.max(target_price.abs() * price_threshold) * level_scale;
+        let volume_limit = volume_floor.max(target_order.quantity.abs() * volume_threshold);
+
+        if price_delta > price_limit || volume_delta > volume_limit {
+            diff.changed_count += 1;
+            if let Some(order_id) = current_order.order_id.clone() {
+                diff.to_cancel_order_ids.push(order_id);
+            }
+            diff.to_place.push((*target_order).clone());
+        }
+    }
+
+    diff
+}
+
+fn infer_fill_analytics(state: &BotState, fill: &Fill) -> (usize, Decimal) {
+    let matching_orders: Vec<&crate::domain::OpenOrder> = state
+        .open_orders
+        .values()
+        .chain(state.dry_run_orders.values())
+        .filter(|order| order.symbol == fill.symbol && order.side == fill.side)
+        .collect();
+
+    let level_index = matching_orders
+        .iter()
+        .min_by(|left, right| {
+            let left_delta = (left.price.unwrap_or(fill.price) - fill.price).abs();
+            let right_delta = (right.price.unwrap_or(fill.price) - fill.price).abs();
+            left_delta.cmp(&right_delta)
+        })
+        .and_then(|order| order.level_index)
+        .unwrap_or(0);
+
+    // Spread earned = our fill price distance from mid — actual captured edge, not BBO/2.
+    let mid = state
+        .market
+        .symbols
+        .get(&fill.symbol)
+        .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
+        .unwrap_or(fill.price);
+    let spread_earned_bps = if mid > Decimal::ZERO {
+        let edge = match fill.side {
+            Side::Bid => mid - fill.price, // filled below mid → positive edge
+            Side::Ask => fill.price - mid, // filled above mid → positive edge
+        };
+        (edge / mid * Decimal::from(10_000u64)).max(Decimal::ZERO)
+    } else {
+        Decimal::ONE
+    };
+
+    (level_index, spread_earned_bps.max(Decimal::new(1, 2)))
+}
+
+fn market_reference(
+    state: &BotState,
+    event: &MarketEvent,
+) -> Option<(String, Decimal, chrono::DateTime<Utc>)> {
+    match event {
+        MarketEvent::MarkPrice {
+            symbol,
+            price,
+            timestamp,
+        }
+        | MarketEvent::SpotPrice {
+            symbol,
+            price,
+            timestamp,
+        } => Some((symbol.clone(), *price, *timestamp)),
+        MarketEvent::BestBidAsk {
+            symbol,
+            bid,
+            ask,
+            timestamp,
+        } => Some((
+            symbol.clone(),
+            (*bid + *ask) / Decimal::from(2u64),
+            *timestamp,
+        )),
+        MarketEvent::Trade {
+            symbol,
+            price,
+            timestamp,
+            ..
+        } => Some((symbol.clone(), *price, *timestamp)),
+        MarketEvent::OrderBookSnapshot {
+            symbol, timestamp, ..
+        }
+        | MarketEvent::OrderBookUpdate {
+            symbol, timestamp, ..
+        } => state
+            .market
+            .symbols
+            .get(symbol)
+            .and_then(|market| market.mid_price())
+            .map(|mid| (symbol.clone(), mid, *timestamp)),
+        MarketEvent::StreamReconnected { .. } => None,
+    }
+}
+
+fn log_dry_run_orders(desired: &[OrderRequest]) {
+    for order in desired {
+        info!(
+            symbol = %order.symbol,
+            level_index = order.level_index,
+            side = ?order.side,
+            price = ?order.price,
+            quantity = %order.quantity,
+            post_only = order.post_only,
+            "dry-run quote"
+        );
+    }
+}

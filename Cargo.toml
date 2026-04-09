@@ -1,0 +1,26 @@
+[package]
+name = "market-making"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+ethers-core = "2.0"
+ethers-signers = "2.0"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1.36", features = ["serde-str", "maths"] }
+secp256k1 = { version = "0.31", features = ["global-context", "recovery"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1.48", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

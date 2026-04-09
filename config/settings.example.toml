@@ -1,0 +1,124 @@
+[venue]
+kind = "hibachi"
+api_base_url = "https://api.hibachi.xyz"
+data_api_base_url = "https://data-api.hibachi.xyz"
+ws_market_url = "wss://data-api.hibachi.xyz/ws/market"
+ws_account_url = "wss://api.hibachi.xyz/ws/account"
+account_id = 140
+api_key = "REPLACE_ME"
+private_key = "REPLACE_ME"
+auth_mode = "exchange_managed"
+user_agent = "market-making-bot/0.1.0"
+maker_fee_ratio = "0"
+max_fee_rate = "0.0005"
+creation_deadline_ms = 15000
+price_multiplier = "4294967296"
+grvt_auth_base_url = "https://edge.grvt.io"
+grvt_market_data_base_url = "https://market-data.grvt.io"
+grvt_trading_base_url = "https://trades.grvt.io"
+grvt_market_ws_url = "wss://market-data.grvt.io/ws/full"
+grvt_trading_ws_url = "wss://trades.grvt.io/ws/full"
+grvt_account_id = ""
+grvt_sub_account_id = ""
+grvt_private_key = ""
+grvt_chain_id = "325"
+grvt_builder_id = ""
+grvt_builder_fee = "0"
+
+[runtime]
+dry_run = true
+restore_dry_run_state = true
+reconcile_interval_ms = 1500
+generation_min_interval_ms = 1500
+stale_market_data_ms = 5000
+websocket_send_timeout_ms = 5000
+max_orderbook_depth = 100
+
+[network]
+private_rest_min_interval_ms = 200
+retry_max_attempts = 4
+retry_initial_backoff_ms = 250
+retry_max_backoff_ms = 2000
+websocket_reconnect_backoff_ms = 1000
+
+[model]
+born_inf_bps = "5"
+born_sup_bps = "30"
+v0 = "0.3"
+mu = "0.5"
+sigma = "2"
+n_points = 5
+min_step_price = "0.000001"
+min_step_volume = "1"
+min_trade_amount = "5"
+position_size_skew_weight = "0.5"
+position_spread_multiplier = "1.1"
+position_dead_zone = "0.001"
+price_sensitivity_threshold = "0.0005"
+price_sensitivity_scaling_factor = "0.75"
+volume_sensitivity_threshold = "0.10"
+volatility_cut_threshold = "0.010"
+index_forward_buffer_bps = "2"
+max_spread_bps = "50"
+prevent_spread_crossing = true
+cancel_orders_crossing_mid = true
+as_gamma = "0.3"
+as_kappa = "2000.0"
+as_time_horizon = "0.5"
+inventory_lean_bps = "10.0"
+
+[risk]
+max_abs_position_usd = "800"
+max_symbol_position_usd = "800"
+max_drawdown_usd = "20"
+max_open_orders = 20
+emergency_widening_bps = "15"
+circuit_breaker_cooldown_ms = 15000
+emergency_skew_start = "0.65"
+emergency_skew_max = "1.50"
+max_correlated_position_usd = "900"
+
+[factors]
+volume_window_secs = 30
+n_trade_window_secs = 30
+n_trade_quote_threshold = 0
+volatility_ewma_alpha = "0.15"
+volatility_spread_weight = "250"
+inventory_skew_weight = "1.2"
+volume_size_weight = "0.010"
+flow_imbalance_weight = "0.15"
+trade_velocity_alpha = "0.2"
+trade_velocity_burst_threshold = "2"
+bbo_spread_vol_weight = "0.20"
+inventory_risk_constant = "400"
+inventory_skew_convexity = "1.0"
+regime_min_dwell_secs = 3
+cross_symbol_vol_weight = "0.0"
+volatility_floor = "0.0005"
+
+[storage]
+enabled = true
+db_path = "data/fills-grvt-real.db"
+
+[[pairs]]
+symbol = "HYPE/USDT-P"
+enabled = false
+max_position_base = "10"
+price_source = "mark"
+post_only = true
+service_on = true
+side_filter = "both"
+
+[[pairs]]
+symbol = "PUMP/USDT-P"
+enabled = true
+max_position_base = "500000"
+price_source = "mark"
+post_only = true
+service_on = true
+side_filter = "both"
+
+[telegram]
+enabled = false
+bot_token = "REPLACE_ME"
+chat_id = "REPLACE_ME"

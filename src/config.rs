@@ -1,0 +1,610 @@
+use std::{collections::HashMap, fs, path::Path};
+
+use anyhow::{bail, Context, Result};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AppConfig {
+    pub venue: VenueConfig,
+    pub runtime: RuntimeConfig,
+    pub network: NetworkConfig,
+    pub model: ModelConfig,
+    pub risk: RiskConfig,
+    pub factors: FactorConfig,
+    pub storage: Option<StorageConfig>,
+    pub telegram: Option<TelegramConfig>,
+    pub pairs: Vec<PairConfig>,
+}
+
+impl AppConfig {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let content = fs::read_to_string(path.as_ref())?;
+        let config: Self = toml::from_str(&content)
+            .with_context(|| format!("failed to parse config at {}", path.as_ref().display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let parsed = self.parsed()?;
+        if parsed.model.born_inf_bps < Decimal::ZERO || parsed.model.born_sup_bps < Decimal::ZERO {
+            bail!("model spreads must be non-negative");
+        }
+        if parsed.model.born_inf_bps >= parsed.model.born_sup_bps {
+            bail!("model.born_inf_bps must be strictly less than model.born_sup_bps");
+        }
+        if parsed.model.max_spread_bps < parsed.model.born_sup_bps {
+            bail!("model.max_spread_bps must be >= model.born_sup_bps");
+        }
+        if parsed.venue.maker_fee_rate < Decimal::ZERO {
+            bail!("venue.maker_fee_ratio must be non-negative");
+        }
+        if parsed.venue.taker_fee_rate < Decimal::ZERO {
+            bail!("venue.max_fee_rate must be non-negative");
+        }
+        if parsed.runtime.websocket_send_timeout_ms == 0 {
+            bail!("runtime.websocket_send_timeout_ms must be > 0");
+        }
+        if parsed.runtime.max_orderbook_depth == 0 {
+            bail!("runtime.max_orderbook_depth must be > 0");
+        }
+        for pair in &parsed.pairs {
+            if pair.max_position_base < Decimal::ZERO {
+                bail!(
+                    "pair {} max_position_base must be non-negative",
+                    pair.symbol
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn parsed(&self) -> Result<ParsedConfig> {
+        Ok(ParsedConfig {
+            venue: ParsedVenueConfig {
+                maker_fee_rate: parse_decimal(
+                    "venue.maker_fee_ratio",
+                    &self.venue.maker_fee_ratio,
+                )?,
+                taker_fee_rate: parse_decimal("venue.max_fee_rate", &self.venue.max_fee_rate)?,
+            },
+            runtime: ParsedRuntimeConfig {
+                websocket_send_timeout_ms: self.runtime.websocket_send_timeout_ms,
+                max_orderbook_depth: self.runtime.max_orderbook_depth,
+                restore_dry_run_state: self.runtime.restore_dry_run_state,
+            },
+            model: ParsedModelConfig {
+                born_inf_bps: parse_decimal("model.born_inf_bps", &self.model.born_inf_bps)?,
+                born_sup_bps: parse_decimal("model.born_sup_bps", &self.model.born_sup_bps)?,
+                v0: parse_decimal("model.v0", &self.model.v0)?,
+                mu: parse_decimal("model.mu", &self.model.mu)?,
+                sigma: parse_decimal("model.sigma", &self.model.sigma)?,
+                min_step_price: parse_decimal("model.min_step_price", &self.model.min_step_price)?,
+                min_step_volume: parse_decimal(
+                    "model.min_step_volume",
+                    &self.model.min_step_volume,
+                )?,
+                min_trade_amount: parse_decimal(
+                    "model.min_trade_amount",
+                    &self.model.min_trade_amount,
+                )?,
+                position_size_skew_weight: parse_decimal(
+                    "model.position_size_skew_weight",
+                    &self.model.position_size_skew_weight,
+                )?,
+                position_spread_multiplier: parse_decimal(
+                    "model.position_spread_multiplier",
+                    &self.model.position_spread_multiplier,
+                )?,
+                position_dead_zone: parse_decimal(
+                    "model.position_dead_zone",
+                    &self.model.position_dead_zone,
+                )?,
+                price_sensitivity_threshold: parse_decimal(
+                    "model.price_sensitivity_threshold",
+                    &self.model.price_sensitivity_threshold,
+                )?,
+                price_sensitivity_scaling_factor: parse_decimal(
+                    "model.price_sensitivity_scaling_factor",
+                    &self.model.price_sensitivity_scaling_factor,
+                )?,
+                volume_sensitivity_threshold: parse_decimal(
+                    "model.volume_sensitivity_threshold",
+                    &self.model.volume_sensitivity_threshold,
+                )?,
+                volatility_cut_threshold: parse_decimal(
+                    "model.volatility_cut_threshold",
+                    &self.model.volatility_cut_threshold,
+                )?,
+                index_forward_buffer_bps: parse_decimal(
+                    "model.index_forward_buffer_bps",
+                    &self.model.index_forward_buffer_bps,
+                )?,
+                max_spread_bps: parse_decimal("model.max_spread_bps", &self.model.max_spread_bps)?,
+                as_gamma: parse_decimal("model.as_gamma", &self.model.as_gamma)?,
+                as_kappa: parse_decimal("model.as_kappa", &self.model.as_kappa)?,
+                as_time_horizon: parse_decimal("model.as_time_horizon", &self.model.as_time_horizon)?,
+            },
+            risk: ParsedRiskConfig {
+                max_abs_position_usd: parse_decimal(
+                    "risk.max_abs_position_usd",
+                    &self.risk.max_abs_position_usd,
+                )?,
+                max_symbol_position_usd: parse_decimal(
+                    "risk.max_symbol_position_usd",
+                    &self.risk.max_symbol_position_usd,
+                )?,
+                max_drawdown_usd: parse_decimal(
+                    "risk.max_drawdown_usd",
+                    &self.risk.max_drawdown_usd,
+                )?,
+                emergency_widening_bps: parse_decimal(
+                    "risk.emergency_widening_bps",
+                    &self.risk.emergency_widening_bps,
+                )?,
+                emergency_skew_start: parse_decimal(
+                    "risk.emergency_skew_start",
+                    &self.risk.emergency_skew_start,
+                )?,
+                emergency_skew_max: parse_decimal(
+                    "risk.emergency_skew_max",
+                    &self.risk.emergency_skew_max,
+                )?,
+                max_correlated_position_usd: parse_decimal(
+                    "risk.max_correlated_position_usd",
+                    &self.risk.max_correlated_position_usd,
+                )?,
+                circuit_breaker_cooldown_ms: self.risk.circuit_breaker_cooldown_ms,
+                emergency_unwind_threshold: parse_decimal(
+                    "risk.emergency_unwind_threshold",
+                    &self.risk.emergency_unwind_threshold,
+                )?,
+                emergency_unwind_cycles: self.risk.emergency_unwind_cycles,
+            },
+            factors: ParsedFactorConfig {
+                volatility_ewma_alpha: parse_decimal(
+                    "factors.volatility_ewma_alpha",
+                    &self.factors.volatility_ewma_alpha,
+                )?,
+                volatility_spread_weight: parse_decimal(
+                    "factors.volatility_spread_weight",
+                    &self.factors.volatility_spread_weight,
+                )?,
+                inventory_skew_weight: parse_decimal(
+                    "factors.inventory_skew_weight",
+                    &self.factors.inventory_skew_weight,
+                )?,
+                volume_size_weight: parse_decimal(
+                    "factors.volume_size_weight",
+                    &self.factors.volume_size_weight,
+                )?,
+                flow_imbalance_weight: parse_decimal(
+                    "factors.flow_imbalance_weight",
+                    &self.factors.flow_imbalance_weight,
+                )?,
+                trade_velocity_alpha: parse_decimal(
+                    "factors.trade_velocity_alpha",
+                    &self.factors.trade_velocity_alpha,
+                )?,
+                trade_velocity_burst_threshold: parse_decimal(
+                    "factors.trade_velocity_burst_threshold",
+                    &self.factors.trade_velocity_burst_threshold,
+                )?,
+                bbo_spread_vol_weight: parse_decimal(
+                    "factors.bbo_spread_vol_weight",
+                    &self.factors.bbo_spread_vol_weight,
+                )?,
+                inventory_risk_constant: parse_decimal(
+                    "factors.inventory_risk_constant",
+                    &self.factors.inventory_risk_constant,
+                )?,
+                inventory_skew_convexity: parse_decimal(
+                    "factors.inventory_skew_convexity",
+                    &self.factors.inventory_skew_convexity,
+                )?,
+                regime_min_dwell_secs: self.factors.regime_min_dwell_secs,
+                cross_symbol_vol_weight: parse_decimal(
+                    "factors.cross_symbol_vol_weight",
+                    &self.factors.cross_symbol_vol_weight,
+                )?,
+                volatility_floor: parse_decimal(
+                    "factors.volatility_floor",
+                    &self.factors.volatility_floor,
+                )?,
+            },
+            pairs: self
+                .pairs
+                .iter()
+                .map(|pair| {
+                    Ok(ParsedPairConfig {
+                        symbol: pair.symbol.clone(),
+                        max_position_base: parse_decimal(
+                            &format!("pairs.{}.max_position_base", pair.symbol),
+                            &pair.max_position_base,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    pub fn pairs_by_symbol(&self) -> HashMap<&str, &PairConfig> {
+        self.pairs
+            .iter()
+            .map(|pair| (pair.symbol.as_str(), pair))
+            .collect()
+    }
+}
+
+fn parse_decimal(field: &str, raw: &str) -> Result<Decimal> {
+    raw.parse::<Decimal>()
+        .with_context(|| format!("invalid decimal for {field}: {raw}"))
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedConfig {
+    pub venue: ParsedVenueConfig,
+    pub runtime: ParsedRuntimeConfig,
+    pub model: ParsedModelConfig,
+    pub risk: ParsedRiskConfig,
+    pub factors: ParsedFactorConfig,
+    pub pairs: Vec<ParsedPairConfig>,
+}
+
+impl ParsedConfig {
+    pub fn pair(&self, symbol: &str) -> Option<&ParsedPairConfig> {
+        self.pairs.iter().find(|pair| pair.symbol == symbol)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedVenueConfig {
+    pub maker_fee_rate: Decimal,
+    pub taker_fee_rate: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedRuntimeConfig {
+    pub websocket_send_timeout_ms: u64,
+    pub max_orderbook_depth: usize,
+    pub restore_dry_run_state: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedModelConfig {
+    pub born_inf_bps: Decimal,
+    pub born_sup_bps: Decimal,
+    pub v0: Decimal,
+    pub mu: Decimal,
+    pub sigma: Decimal,
+    pub min_step_price: Decimal,
+    pub min_step_volume: Decimal,
+    pub min_trade_amount: Decimal,
+    pub position_size_skew_weight: Decimal,
+    pub position_spread_multiplier: Decimal,
+    pub position_dead_zone: Decimal,
+    pub price_sensitivity_threshold: Decimal,
+    pub price_sensitivity_scaling_factor: Decimal,
+    pub volume_sensitivity_threshold: Decimal,
+    pub volatility_cut_threshold: Decimal,
+    pub index_forward_buffer_bps: Decimal,
+    pub max_spread_bps: Decimal,
+    pub as_gamma: Decimal,
+    pub as_kappa: Decimal,
+    pub as_time_horizon: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedRiskConfig {
+    pub max_abs_position_usd: Decimal,
+    pub max_symbol_position_usd: Decimal,
+    pub max_drawdown_usd: Decimal,
+    pub emergency_widening_bps: Decimal,
+    pub emergency_skew_start: Decimal,
+    pub emergency_skew_max: Decimal,
+    pub max_correlated_position_usd: Decimal,
+    pub circuit_breaker_cooldown_ms: u64,
+    pub emergency_unwind_threshold: Decimal,
+    pub emergency_unwind_cycles: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedFactorConfig {
+    pub volatility_ewma_alpha: Decimal,
+    pub volatility_spread_weight: Decimal,
+    pub inventory_skew_weight: Decimal,
+    pub volume_size_weight: Decimal,
+    pub flow_imbalance_weight: Decimal,
+    pub trade_velocity_alpha: Decimal,
+    pub trade_velocity_burst_threshold: Decimal,
+    pub bbo_spread_vol_weight: Decimal,
+    pub inventory_risk_constant: Decimal,
+    pub inventory_skew_convexity: Decimal,
+    pub regime_min_dwell_secs: u64,
+    pub cross_symbol_vol_weight: Decimal,
+    pub volatility_floor: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedPairConfig {
+    pub symbol: String,
+    pub max_position_base: Decimal,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VenueConfig {
+    #[serde(default)]
+    pub kind: ExchangeKind,
+    pub api_base_url: String,
+    pub data_api_base_url: String,
+    pub ws_market_url: String,
+    pub ws_account_url: String,
+    pub account_id: u64,
+    pub api_key: String,
+    pub private_key: String,
+    pub auth_mode: HibachiAuthMode,
+    pub user_agent: String,
+    #[serde(default = "default_zero_string")]
+    pub maker_fee_ratio: String,
+    pub max_fee_rate: String,
+    pub creation_deadline_ms: u64,
+    pub price_multiplier: String,
+    #[serde(default)]
+    pub grvt_auth_base_url: String,
+    #[serde(default)]
+    pub grvt_market_data_base_url: String,
+    #[serde(default)]
+    pub grvt_trading_base_url: String,
+    #[serde(default)]
+    pub grvt_market_ws_url: String,
+    #[serde(default)]
+    pub grvt_trading_ws_url: String,
+    #[serde(default)]
+    pub grvt_account_id: String,
+    #[serde(default)]
+    pub grvt_sub_account_id: String,
+    #[serde(default)]
+    pub grvt_private_key: String,
+    #[serde(default)]
+    pub grvt_api_key: String,
+    #[serde(default)]
+    pub grvt_chain_id: String,
+    #[serde(default)]
+    pub grvt_builder_id: String,
+    #[serde(default = "default_zero_string")]
+    pub grvt_builder_fee: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeKind {
+    #[default]
+    Hibachi,
+    Grvt,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HibachiAuthMode {
+    ExchangeManaged,
+    Trustless,
+}
+
+fn default_zero_string() -> String {
+    "0".to_string()
+}
+
+fn default_websocket_send_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_max_orderbook_depth() -> usize {
+    100
+}
+
+fn default_restore_dry_run_state() -> bool {
+    true
+}
+
+fn default_max_spread_bps() -> String {
+    "100".to_string()
+}
+
+fn default_circuit_breaker_cooldown_ms() -> u64 {
+    30_000
+}
+
+fn default_emergency_unwind_threshold() -> String {
+    "0.8".to_string()
+}
+
+fn default_emergency_unwind_cycles() -> usize {
+    5
+}
+
+fn default_empty_quote_alert_cycles() -> usize {
+    5
+}
+
+fn default_inventory_skew_convexity() -> String {
+    "1.0".to_string()
+}
+
+fn default_regime_min_dwell_secs() -> u64 {
+    3
+}
+
+fn default_position_size_skew_weight() -> String {
+    "0.5".to_string()
+}
+
+fn default_as_gamma() -> String {
+    "0.3".to_string()
+}
+
+fn default_as_kappa() -> String {
+    "500.0".to_string()
+}
+
+fn default_as_time_horizon() -> String {
+    "0.5".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeConfig {
+    pub dry_run: bool,
+    pub reconcile_interval_ms: u64,
+    pub generation_min_interval_ms: u64,
+    pub stale_market_data_ms: i64,
+    #[serde(default = "default_websocket_send_timeout_ms")]
+    pub websocket_send_timeout_ms: u64,
+    #[serde(default = "default_max_orderbook_depth")]
+    pub max_orderbook_depth: usize,
+    #[serde(default = "default_restore_dry_run_state")]
+    pub restore_dry_run_state: bool,
+    /// Number of consecutive empty-quote cycles (while holding a position) before
+    /// emitting a Telegram alert.
+    #[serde(default = "default_empty_quote_alert_cycles")]
+    pub empty_quote_alert_cycles: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NetworkConfig {
+    pub private_rest_min_interval_ms: u64,
+    pub retry_max_attempts: usize,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
+    pub websocket_reconnect_backoff_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ModelConfig {
+    pub born_inf_bps: String,
+    pub born_sup_bps: String,
+    pub v0: String,
+    pub mu: String,
+    pub sigma: String,
+    pub n_points: usize,
+    pub min_step_price: String,
+    pub min_step_volume: String,
+    pub min_trade_amount: String,
+    /// How strongly a large position skews order sizes towards the unwind side. (S2)
+    #[serde(default = "default_position_size_skew_weight")]
+    pub position_size_skew_weight: String,
+    pub position_spread_multiplier: String,
+    pub position_dead_zone: String,
+    pub price_sensitivity_threshold: String,
+    pub price_sensitivity_scaling_factor: String,
+    pub volume_sensitivity_threshold: String,
+    pub volatility_cut_threshold: String,
+    pub index_forward_buffer_bps: String,
+    #[serde(default = "default_max_spread_bps")]
+    pub max_spread_bps: String,
+    pub prevent_spread_crossing: bool,
+    pub cancel_orders_crossing_mid: bool,
+    /// Avellaneda-Stoikov risk aversion parameter (γ). Higher = wider spread.
+    #[serde(default = "default_as_gamma")]
+    pub as_gamma: String,
+    /// A-S market order arrival rate approximation (κ). Higher = tighter spread.
+    #[serde(default = "default_as_kappa")]
+    pub as_kappa: String,
+    /// A-S inventory time horizon in hours.
+    #[serde(default = "default_as_time_horizon")]
+    pub as_time_horizon: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RiskConfig {
+    pub max_abs_position_usd: String,
+    pub max_symbol_position_usd: String,
+    pub max_drawdown_usd: String,
+    pub max_open_orders: usize,
+    pub emergency_widening_bps: String,
+    #[serde(default = "default_zero_string")]
+    pub emergency_skew_start: String,
+    #[serde(default = "default_zero_string")]
+    pub emergency_skew_max: String,
+    #[serde(default = "default_zero_string")]
+    pub max_correlated_position_usd: String,
+    #[serde(default = "default_circuit_breaker_cooldown_ms")]
+    pub circuit_breaker_cooldown_ms: u64,
+    /// Fraction of max_position_base at which emergency-unwind mode triggers.
+    #[serde(default = "default_emergency_unwind_threshold")]
+    pub emergency_unwind_threshold: String,
+    /// Consecutive empty-unwind cycles before emergency mode activates.
+    #[serde(default = "default_emergency_unwind_cycles")]
+    pub emergency_unwind_cycles: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FactorConfig {
+    pub volume_window_secs: i64,
+    pub n_trade_window_secs: i64,
+    pub n_trade_quote_threshold: usize,
+    pub volatility_ewma_alpha: String,
+    pub volatility_spread_weight: String,
+    pub inventory_skew_weight: String,
+    pub volume_size_weight: String,
+    #[serde(default = "default_zero_string")]
+    pub flow_imbalance_weight: String,
+    #[serde(default = "default_zero_string")]
+    pub trade_velocity_alpha: String,
+    #[serde(default = "default_zero_string")]
+    pub trade_velocity_burst_threshold: String,
+    #[serde(default = "default_zero_string")]
+    pub bbo_spread_vol_weight: String,
+    #[serde(default = "default_zero_string")]
+    pub inventory_risk_constant: String,
+    /// Convexity of the inventory skew penalty; higher = grows faster near limits. (S3)
+    #[serde(default = "default_inventory_skew_convexity")]
+    pub inventory_skew_convexity: String,
+    /// Minimum seconds in a regime before allowing a regime transition. (S5)
+    #[serde(default = "default_regime_min_dwell_secs")]
+    pub regime_min_dwell_secs: u64,
+    #[serde(default = "default_zero_string")]
+    pub cross_symbol_vol_weight: String,
+    #[serde(default = "default_zero_string")]
+    pub volatility_floor: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StorageConfig {
+    pub enabled: bool,
+    pub db_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PairConfig {
+    pub symbol: String,
+    pub enabled: bool,
+    pub max_position_base: String,
+    pub price_source: PriceSource,
+    pub post_only: bool,
+    pub service_on: bool,
+    pub side_filter: SideFilter,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SideFilter {
+    Both,
+    BidOnly,
+    AskOnly,
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    Mid,
+    Mark,
+    Spot,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub chat_id: String,
+    pub enabled: bool,
+}

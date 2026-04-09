@@ -1,0 +1,31 @@
+services:
+
+  # ── Hibachi (live-test) ────────────────────────────────────────────────────
+  hibachi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONFIG_FILE: config/settings.live-test.toml
+    image: market-making:hibachi
+    container_name: market-making-hibachi
+    restart: unless-stopped
+    volumes:
+      - ./data/hibachi:/app/data
+    environment:
+      RUST_LOG: info,market_making=debug
+
+  # ── GRVT (real) ────────────────────────────────────────────────────────────
+  grvt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONFIG_FILE: config/settings.grvt.real.toml
+    image: market-making:grvt
+    container_name: market-making-grvt
+    restart: unless-stopped
+    volumes:
+      - ./data/grvt:/app/data
+    environment:
+      RUST_LOG: info,market_making=debug
