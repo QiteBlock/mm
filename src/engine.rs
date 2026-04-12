@@ -220,7 +220,9 @@ where
     }
 
     pub async fn run(&self) -> Result<()> {
+        info!("engine run starting");
         let instruments = self.exchange.load_instruments().await?;
+        info!(count = instruments.len(), "engine instruments loaded");
         let instrument_by_symbol: HashMap<String, InstrumentMeta> = instruments
             .into_iter()
             .map(|instrument| (instrument.symbol.clone(), instrument))
@@ -233,12 +235,16 @@ where
             .filter(|pair| pair.enabled)
             .map(|pair| pair.symbol.clone())
             .collect();
+        info!(symbols = ?market_symbols, "engine enabled market symbols");
 
         let initial_orders = self.exchange.fetch_open_orders().await?;
+        info!(count = initial_orders.len(), "engine initial open orders fetched");
         let (market_tx, mut market_rx) = mpsc::channel(1024);
         let (private_tx, mut private_rx) = mpsc::channel(512);
+        info!("engine spawning all streams");
         let mut streams_task =
             self.spawn_all_streams(market_symbols.clone(), market_tx, private_tx);
+        info!("engine streams task spawned");
         let mut state = BotState::new(
             self.parsed.venue.maker_fee_rate,
             self.parsed.runtime.max_orderbook_depth,
@@ -827,6 +833,7 @@ where
         private_sender: mpsc::Sender<PrivateEvent>,
     ) -> JoinHandle<Result<()>> {
         let exchange = self.exchange.clone();
+        info!(symbols = ?symbols, "spawning exchange streams");
         // Build Binance symbol map from pair configs that have binance_symbol set.
         let binance_symbol_map: HashMap<String, String> = self
             .config

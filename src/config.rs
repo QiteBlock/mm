@@ -402,6 +402,7 @@ pub enum ExchangeKind {
     #[default]
     Hibachi,
     Grvt,
+    Extended,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

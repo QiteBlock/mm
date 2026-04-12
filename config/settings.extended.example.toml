@@ -1,0 +1,122 @@
+[venue]
+kind = "extended"
+api_base_url = "https://api.starknet.extended.exchange"
+data_api_base_url = "https://api.starknet.extended.exchange"
+ws_market_url = "wss://api.starknet.extended.exchange"
+ws_account_url = "wss://api.starknet.extended.exchange"
+account_id = 0
+api_key = "REPLACE_WITH_EXTENDED_API_KEY"
+private_key = "REPLACE_WITH_EXTENDED_STARK_PRIVATE_KEY"
+auth_mode = "trustless"
+user_agent = "market-making-bot/0.1.0"
+maker_fee_ratio = "0"
+max_fee_rate = "0.00025"
+creation_deadline_ms = 15000
+price_multiplier = "1"
+grvt_auth_base_url = ""
+grvt_market_data_base_url = ""
+grvt_trading_base_url = ""
+grvt_market_ws_url = ""
+grvt_trading_ws_url = ""
+grvt_account_id = ""
+grvt_sub_account_id = ""
+grvt_private_key = ""
+grvt_api_key = ""
+grvt_chain_id = ""
+grvt_builder_id = ""
+grvt_builder_fee = "0"
+
+[runtime]
+dry_run = true
+restore_dry_run_state = false
+reconcile_interval_ms = 1000
+generation_min_interval_ms = 1000
+stale_market_data_ms = 10000
+websocket_send_timeout_ms = 5000
+max_orderbook_depth = 100
+
+[network]
+private_rest_min_interval_ms = 100
+retry_max_attempts = 4
+retry_initial_backoff_ms = 250
+retry_max_backoff_ms = 2000
+websocket_reconnect_backoff_ms = 1000
+
+[model]
+born_inf_bps = "3"
+born_sup_bps = "12"
+v0 = "35"
+mu = "0.5"
+sigma = "2"
+n_points = 3
+min_step_price = "0.5"
+min_step_volume = "1"
+min_trade_amount = "5"
+position_size_skew_weight = "0.5"
+position_spread_multiplier = "1.5"
+position_dead_zone = "0.001"
+price_sensitivity_threshold = "0.003"
+price_sensitivity_scaling_factor = "0.75"
+volume_sensitivity_threshold = "0.10"
+volatility_cut_threshold = "0.010"
+index_forward_buffer_bps = "2"
+max_spread_bps = "50"
+prevent_spread_crossing = true
+cancel_orders_crossing_mid = true
+as_gamma = "0.3"
+as_kappa = "4000.0"
+as_time_horizon = "0.5"
+inventory_lean_bps = "4.0"
+as_vol_cap = "0.001"
+
+[risk]
+max_abs_position_usd = "500"
+max_symbol_position_usd = "500"
+max_drawdown_usd = "25"
+max_open_orders = 20
+emergency_widening_bps = "15"
+circuit_breaker_cooldown_ms = 8000
+emergency_skew_start = "0.65"
+emergency_skew_max = "1.50"
+max_correlated_position_usd = "500"
+emergency_unwind_threshold = "0.8"
+emergency_unwind_cycles = 5
+
+[factors]
+volume_window_secs = 30
+n_trade_window_secs = 30
+n_trade_quote_threshold = 0
+volatility_ewma_alpha = "0.25"
+volatility_spread_weight = "250"
+inventory_skew_weight = "1.2"
+volume_size_weight = "0.010"
+flow_imbalance_weight = "0.08"
+trade_velocity_alpha = "0.35"
+trade_velocity_burst_threshold = "2"
+bbo_spread_vol_weight = "0.20"
+inventory_risk_constant = "400"
+inventory_skew_convexity = "1.0"
+regime_min_dwell_secs = 3
+cross_symbol_vol_weight = "0.0"
+volatility_floor = "0.0005"
+ob_imbalance_weight = "3.0"
+ob_imbalance_depth = 10
+bbo_spread_cap_bps = "20"
+
+[storage]
+enabled = true
+db_path = "data/fills-extended.db"
+
+[[pairs]]
+symbol = "CRV-USD"
+enabled = true
+max_position_base = "300"
+price_source = "mark"
+post_only = true
+service_on = true
+side_filter = "both"
+
+[telegram]
+enabled = false
+bot_token = "REPLACE_ME"
+chat_id = "REPLACE_ME"

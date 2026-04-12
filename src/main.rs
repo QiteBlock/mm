@@ -6,10 +6,11 @@ use market_making::{
     config::{AppConfig, ExchangeKind},
     control::RuntimeControl,
     engine::MarketMakingEngine,
-    exchange::{grvt::GrvtClient, hibachi::HibachiClient, AnyExchangeClient},
+    exchange::{extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient, AnyExchangeClient},
     storage::FillStore,
     telegram::{TelegramCommand, TelegramNotifier},
 };
+use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +37,10 @@ async fn main() -> Result<()> {
         ExchangeKind::Grvt => {
             AnyExchangeClient::Grvt(GrvtClient::new(config.venue.clone(), &config.network)?)
         }
+        ExchangeKind::Extended => AnyExchangeClient::Extended(ExtendedClient::new(
+            config.venue.clone(),
+            &config.network,
+        )?),
     });
     let fill_store = Arc::new(FillStore::from_config(config.storage.as_ref())?);
     let control = Arc::new(RuntimeControl::default());
@@ -101,8 +106,18 @@ async fn run_telegram_command_loop(
 ) -> Result<()> {
     let mut next_offset = None;
     let mut ignore_first_batch = true;
+    let telegram_enabled = config
+        .telegram
+        .as_ref()
+        .map(|cfg| cfg.enabled)
+        .unwrap_or(false);
 
     loop {
+        if !telegram_enabled {
+            sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+
         match notifier.poll_commands(next_offset, 15).await {
             Ok(commands) => {
                 if let Some(max_update_id) = commands.iter().map(|(id, _)| *id).max() {

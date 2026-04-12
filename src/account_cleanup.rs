@@ -148,6 +148,7 @@ impl CleanupExchange for AnyExchangeClient {
         match self {
             AnyExchangeClient::Grvt(client) => client.submit_limit_close_orders(positions).await,
             AnyExchangeClient::Hibachi(_) => Ok(()),
+            AnyExchangeClient::Extended(_) => Ok(()),
         }
     }
 
@@ -155,6 +156,7 @@ impl CleanupExchange for AnyExchangeClient {
         match self {
             AnyExchangeClient::Grvt(client) => client.submit_market_close_orders(positions).await,
             AnyExchangeClient::Hibachi(_) => Ok(()),
+            AnyExchangeClient::Extended(_) => Ok(()),
         }
     }
 

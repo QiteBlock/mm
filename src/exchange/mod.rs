@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use crate::config::ExchangeKind;
 use crate::domain::{InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, Position, PrivateEvent};
 
-use self::{grvt::GrvtClient, hibachi::HibachiClient};
+use self::{extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient};
 
+pub mod extended;
 pub mod grvt;
 pub mod hibachi;
 
@@ -77,6 +78,7 @@ pub trait ExchangeClient:
 pub enum AnyExchangeClient {
     Hibachi(HibachiClient),
     Grvt(GrvtClient),
+    Extended(ExtendedClient),
 }
 
 impl AnyExchangeClient {
@@ -84,6 +86,7 @@ impl AnyExchangeClient {
         match self {
             Self::Hibachi(_) => ExchangeKind::Hibachi,
             Self::Grvt(_) => ExchangeKind::Grvt,
+            Self::Extended(_) => ExchangeKind::Extended,
         }
     }
 }
@@ -98,6 +101,7 @@ impl MarketDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.stream_mark_prices(symbols, sender).await,
             Self::Grvt(client) => client.stream_mark_prices(symbols, sender).await,
+            Self::Extended(client) => client.stream_mark_prices(symbols, sender).await,
         }
     }
 
@@ -109,6 +113,7 @@ impl MarketDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.stream_spot_prices(symbols, sender).await,
             Self::Grvt(client) => client.stream_spot_prices(symbols, sender).await,
+            Self::Extended(client) => client.stream_spot_prices(symbols, sender).await,
         }
     }
 
@@ -120,6 +125,7 @@ impl MarketDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.stream_best_bid_ask(symbols, sender).await,
             Self::Grvt(client) => client.stream_best_bid_ask(symbols, sender).await,
+            Self::Extended(client) => client.stream_best_bid_ask(symbols, sender).await,
         }
     }
 
@@ -131,6 +137,7 @@ impl MarketDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.stream_trades(symbols, sender).await,
             Self::Grvt(client) => client.stream_trades(symbols, sender).await,
+            Self::Extended(client) => client.stream_trades(symbols, sender).await,
         }
     }
 
@@ -142,6 +149,7 @@ impl MarketDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.stream_orderbook(symbols, sender).await,
             Self::Grvt(client) => client.stream_orderbook(symbols, sender).await,
+            Self::Extended(client) => client.stream_orderbook(symbols, sender).await,
         }
     }
 }
@@ -155,6 +163,7 @@ impl PrivateDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.stream_private_data(sender).await,
             Self::Grvt(client) => client.stream_private_data(sender).await,
+            Self::Extended(client) => client.stream_private_data(sender).await,
         }
     }
 
@@ -162,6 +171,7 @@ impl PrivateDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.fetch_open_orders().await,
             Self::Grvt(client) => client.fetch_open_orders().await,
+            Self::Extended(client) => client.fetch_open_orders().await,
         }
     }
 
@@ -169,6 +179,7 @@ impl PrivateDataSource for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.fetch_positions().await,
             Self::Grvt(client) => client.fetch_positions().await,
+            Self::Extended(client) => client.fetch_positions().await,
         }
     }
 }
@@ -179,6 +190,7 @@ impl OrderExecutor for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.place_orders(requests).await,
             Self::Grvt(client) => client.place_orders(requests).await,
+            Self::Extended(client) => client.place_orders(requests).await,
         }
     }
 
@@ -186,6 +198,7 @@ impl OrderExecutor for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.cancel_orders(order_ids).await,
             Self::Grvt(client) => client.cancel_orders(order_ids).await,
+            Self::Extended(client) => client.cancel_orders(order_ids).await,
         }
     }
 
@@ -193,6 +206,7 @@ impl OrderExecutor for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.cancel_all_orders().await,
             Self::Grvt(client) => client.cancel_all_orders().await,
+            Self::Extended(client) => client.cancel_all_orders().await,
         }
     }
 }
@@ -203,6 +217,7 @@ impl ExchangeClient for AnyExchangeClient {
         match self {
             Self::Hibachi(client) => client.load_instruments().await,
             Self::Grvt(client) => client.load_instruments().await,
+            Self::Extended(client) => client.load_instruments().await,
         }
     }
 
@@ -210,6 +225,7 @@ impl ExchangeClient for AnyExchangeClient {
         match self {
             Self::Hibachi(_) => Vec::new(),
             Self::Grvt(client) => client.fetch_market_snapshot(symbols).await,
+            Self::Extended(client) => client.fetch_market_snapshot(symbols).await,
         }
     }
 }

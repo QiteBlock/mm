@@ -4,6 +4,7 @@ config/settings.toml
 config/settings.live-test.toml
 config/settings.grvt.live-test.toml
 config/settings.grvt.real.toml
+config/settings.extended.real.toml
 .cargos
 data/
 *.db
