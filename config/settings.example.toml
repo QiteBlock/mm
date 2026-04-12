@@ -41,61 +41,62 @@ retry_initial_backoff_ms = 250
 retry_max_backoff_ms = 2000
 websocket_reconnect_backoff_ms = 1000
 
+
 [model]
-born_inf_bps = "10"
-born_sup_bps = "40"
-v0 = "15"
+born_inf_bps = "1"
+born_sup_bps = "5"
+v0 = "0.5"
 mu = "0.5"
-sigma = "2"
-n_points = 5
-min_step_price = "0.0001"
-min_step_volume = "0.1"
+sigma = "2.7"
+n_points = 1
+min_step_price = "0.001"
+min_step_volume = "0.01"
 min_trade_amount = "5"
-position_size_skew_weight = "0.5"
-position_spread_multiplier = "1.5"
+position_size_skew_weight = "0.8"
+position_spread_multiplier = "2.5"
 position_dead_zone = "0.001"
-price_sensitivity_threshold = "0.003"
+price_sensitivity_threshold = "0.005"
 price_sensitivity_scaling_factor = "0.75"
 volume_sensitivity_threshold = "0.10"
-volatility_cut_threshold = "0.010"
+volatility_cut_threshold = "0.015"
 index_forward_buffer_bps = "2"
-max_spread_bps = "50"
+max_spread_bps = "120"
 prevent_spread_crossing = true
 cancel_orders_crossing_mid = true
-as_gamma = "0.3"
+as_gamma = "0.05"
 as_kappa = "4000.0"
 as_time_horizon = "0.5"
-inventory_lean_bps = "4.0"
-as_vol_cap = "0.010"
+inventory_lean_bps = "10.0"
+as_vol_cap = "0.001"
 
 [risk]
-max_abs_position_usd = "1000"
-max_symbol_position_usd = "1000"
-max_drawdown_usd = "20"
+max_abs_position_usd = "100"
+max_symbol_position_usd = "100"
+max_drawdown_usd = "10"
 max_open_orders = 20
-emergency_widening_bps = "15"
-circuit_breaker_cooldown_ms = 8000
+emergency_widening_bps = "3"
+circuit_breaker_cooldown_ms = 3000
 emergency_skew_start = "0.65"
 emergency_skew_max = "1.50"
-max_correlated_position_usd = "500"
+max_correlated_position_usd = "80"
 
 [factors]
 volume_window_secs = 30
 n_trade_window_secs = 30
 n_trade_quote_threshold = 0
-volatility_ewma_alpha = "0.25"
-volatility_spread_weight = "250"
-inventory_skew_weight = "1.2"
-volume_size_weight = "0.010"
-flow_imbalance_weight = "0.08"
-trade_velocity_alpha = "0.35"
+volatility_ewma_alpha = "0.2"
+volatility_spread_weight = "50"
+inventory_skew_weight = "3.0"
+volume_size_weight = "0.015"
+flow_imbalance_weight = "0.01"
+trade_velocity_alpha = "0.3"
 trade_velocity_burst_threshold = "2"
-bbo_spread_vol_weight = "0.20"
-inventory_risk_constant = "400"
+bbo_spread_vol_weight = "0.05"
+inventory_risk_constant = "300"
 inventory_skew_convexity = "1.0"
 regime_min_dwell_secs = 3
 cross_symbol_vol_weight = "0.0"
-volatility_floor = "0.002"
+volatility_floor = "0.0005"
 ob_imbalance_weight = "3.0"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
@@ -106,17 +107,18 @@ db_path = "data/fills-grvt-real.db"
 
 [[pairs]]
 symbol = "HYPE/USDT-P"
-enabled = false
-max_position_base = "10"
-price_source = "mark"
+enabled = true
+max_position_base = "2"
+price_source = "spot"
 post_only = true
 service_on = true
 side_filter = "both"
+binance_symbol = "hypeusdt"
 
 [[pairs]]
 symbol = "EDGE/USDT-P"
-enabled = true
-max_position_base = "500"
+enabled = false
+max_position_base = "50"
 price_source = "spot"
 post_only = true
 service_on = true
