@@ -66,6 +66,7 @@ as_gamma = "0.3"
 as_kappa = "4000.0"
 as_time_horizon = "0.5"
 inventory_lean_bps = "4.0"
+as_vol_cap = "0.010"
 
 [risk]
 max_abs_position_usd = "1000"
@@ -97,6 +98,7 @@ cross_symbol_vol_weight = "0.0"
 volatility_floor = "0.002"
 ob_imbalance_weight = "3.0"
 ob_imbalance_depth = 10
+bbo_spread_cap_bps = "20"
 
 [storage]
 enabled = true

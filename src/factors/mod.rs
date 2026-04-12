@@ -141,9 +141,12 @@ impl FactorEngine {
             volume_window_start,
             parsed.factors.cross_symbol_vol_weight,
         );
+        // B3: cap BBO spread before weighting to prevent momentary wide spreads
+        // from inflating the volatility addon.
         let bbo_spread_component = symbol_state
             .bbo_spread_ewma
             .unwrap_or_else(|| market.bbo_spread_bps().unwrap_or(Decimal::ZERO))
+            .min(parsed.factors.bbo_spread_cap_bps)
             * parsed.factors.bbo_spread_vol_weight;
 
         // S3: Vol-independent, convex inventory skew.
@@ -170,7 +173,7 @@ impl FactorEngine {
         // S5: Continuous regime intensity + minimum dwell time.
         let flow_abs = (symbol_state.smoothed_flow + cross_flow).abs();
         let target_regime =
-            candidate_regime(flow_abs, volatility, trade_velocity_ratio, trade_velocity);
+            candidate_regime(flow_abs, volatility, trade_velocity_ratio, trade_velocity, recent_trade_count);
         let min_dwell = Duration::seconds(parsed.factors.regime_min_dwell_secs as i64);
         let can_change = symbol_state
             .regime_entered_at
@@ -299,9 +302,16 @@ fn candidate_regime(
     volatility: Decimal,
     trade_velocity_ratio: Decimal,
     trade_velocity: Decimal,
+    recent_trade_count: usize,
 ) -> MarketRegime {
+    // B1: trade confidence gate — scale flow by how many trades back the signal.
+    // With < 10 trades in the window the flow estimate is noisy; require proportionally
+    // higher raw imbalance before declaring TrendingToxic.
+    let confidence = Decimal::from(recent_trade_count.min(10) as u64) / Decimal::from(10u64);
+    let confident_flow = flow_abs * confidence;
+
     // Directional flow threshold: net imbalance > 60% of volume → toxic trend.
-    if flow_abs > Decimal::new(6, 1) {
+    if confident_flow > Decimal::new(6, 1) {
         return MarketRegime::TrendingToxic;
     }
     // Volatile: high vol, high velocity ratio vs baseline, OR raw velocity > 1.5 trades/sec

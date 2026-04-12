@@ -123,6 +123,7 @@ impl AppConfig {
                 as_kappa: parse_decimal("model.as_kappa", &self.model.as_kappa)?,
                 as_time_horizon: parse_decimal("model.as_time_horizon", &self.model.as_time_horizon)?,
                 inventory_lean_bps: parse_decimal("model.inventory_lean_bps", &self.model.inventory_lean_bps)?,
+                as_vol_cap: parse_decimal("model.as_vol_cap", &self.model.as_vol_cap)?,
             },
             risk: ParsedRiskConfig {
                 max_abs_position_usd: parse_decimal(
@@ -215,6 +216,10 @@ impl AppConfig {
                     &self.factors.ob_imbalance_weight,
                 )?,
                 ob_imbalance_depth: self.factors.ob_imbalance_depth,
+                bbo_spread_cap_bps: parse_decimal(
+                    "factors.bbo_spread_cap_bps",
+                    &self.factors.bbo_spread_cap_bps,
+                )?,
             },
             pairs: self
                 .pairs
@@ -297,6 +302,9 @@ pub struct ParsedModelConfig {
     pub as_kappa: Decimal,
     pub as_time_horizon: Decimal,
     pub inventory_lean_bps: Decimal,
+    /// Hard cap on vol_per_cycle fed into the A-S formula, preventing BBO noise
+    /// from inflating spreads while genuine volatility still widens them naturally.
+    pub as_vol_cap: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +341,9 @@ pub struct ParsedFactorConfig {
     pub ob_imbalance_weight: Decimal,
     /// Number of top orderbook levels to sum when computing ob_imbalance (0 = all levels).
     pub ob_imbalance_depth: usize,
+    /// Hard cap on BBO spread (in bps) before applying bbo_spread_vol_weight,
+    /// preventing momentary wide spreads from inflating the volatility addon.
+    pub bbo_spread_cap_bps: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -468,6 +479,14 @@ fn default_inventory_lean_bps() -> String {
     "10.0".to_string()
 }
 
+fn default_as_vol_cap() -> String {
+    "0.010".to_string()
+}
+
+fn default_bbo_spread_cap_bps() -> String {
+    "20".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub dry_run: bool,
@@ -533,6 +552,9 @@ pub struct ModelConfig {
     /// Shifts the reservation price by this amount linearly with pos_ratio.
     #[serde(default = "default_inventory_lean_bps")]
     pub inventory_lean_bps: String,
+    /// Hard cap on vol_per_cycle fed into the A-S formula (e.g. "0.010" = 1%).
+    #[serde(default = "default_as_vol_cap")]
+    pub as_vol_cap: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -591,6 +613,9 @@ pub struct FactorConfig {
     pub ob_imbalance_weight: String,
     #[serde(default = "default_ob_imbalance_depth")]
     pub ob_imbalance_depth: usize,
+    /// Hard cap on BBO spread (bps) before applying bbo_spread_vol_weight.
+    #[serde(default = "default_bbo_spread_cap_bps")]
+    pub bbo_spread_cap_bps: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

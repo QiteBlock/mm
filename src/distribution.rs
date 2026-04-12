@@ -51,7 +51,11 @@ pub fn generate_quotes(
     // Annualise σ: raw_volatility is per-cycle log-return std dev (EWMA).
     // At 1s reconcile interval there are 3600 cycles/hour; σ_hour = σ_cycle * sqrt(3600) = σ_cycle * 60.
     // Using sqrt(3600) = 60 in integer arithmetic.
-    let vol_per_cycle = factors.raw_volatility.max(parsed.factors.volatility_floor);
+    // B2: cap vol before it enters A-S to prevent BBO noise from inflating spread.
+    let vol_per_cycle = factors
+        .raw_volatility
+        .max(parsed.factors.volatility_floor)
+        .min(parsed.model.as_vol_cap);
     let cycles_per_hour = Decimal::from(3600u64); // 1s cycles; adjust if reconcile_interval changes
     let vol_per_hour = vol_per_cycle * cycles_per_hour.sqrt().unwrap_or(Decimal::from(60u64));
 
