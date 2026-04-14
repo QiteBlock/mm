@@ -1001,18 +1001,47 @@ where
                 info!(symbol = %pair.symbol, "factor snapshot unavailable; skipping symbol");
                 continue;
             };
+            let current_position = state
+                .positions
+                .get(&pair.symbol)
+                .map(|position| position.quantity)
+                .unwrap_or(Decimal::ZERO);
+            let has_position = current_position != Decimal::ZERO;
+            let mut unwind_only = false;
 
             if factor_snapshot.recent_trade_count < n_trade_threshold {
-                continue;
+                if has_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        recent_trade_count = factor_snapshot.recent_trade_count,
+                        threshold = n_trade_threshold,
+                        "recent trade count below threshold while holding position; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    continue;
+                }
             }
             if factor_snapshot.raw_volatility > vol_cut {
-                warn!(
-                    symbol = %pair.symbol,
-                    raw_volatility = %factor_snapshot.raw_volatility,
-                    threshold = %vol_cut,
-                    "volatility cut threshold exceeded; suppressing quotes"
-                );
-                continue;
+                if has_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        raw_volatility = %factor_snapshot.raw_volatility,
+                        threshold = %vol_cut,
+                        "volatility cut exceeded while holding position; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        raw_volatility = %factor_snapshot.raw_volatility,
+                        threshold = %vol_cut,
+                        "volatility cut threshold exceeded; suppressing quotes"
+                    );
+                    continue;
+                }
             }
 
             // Issue 5: flow spike pause — skip quoting when flow is strongly directional.
@@ -1020,13 +1049,24 @@ where
             if flow_spike_threshold > Decimal::ZERO
                 && factor_snapshot.flow_direction.abs() > flow_spike_threshold
             {
-                warn!(
-                    symbol = %pair.symbol,
-                    flow_direction = %factor_snapshot.flow_direction,
-                    threshold = %flow_spike_threshold,
-                    "flow spike detected; suppressing quotes"
-                );
-                continue;
+                if has_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        flow_direction = %factor_snapshot.flow_direction,
+                        threshold = %flow_spike_threshold,
+                        "flow spike detected while holding position; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        flow_direction = %factor_snapshot.flow_direction,
+                        threshold = %flow_spike_threshold,
+                        "flow spike detected; suppressing quotes"
+                    );
+                    continue;
+                }
             }
 
             factor_snapshot.volatility += emergency_widening_bps(&self.parsed, state, pair);
@@ -1074,11 +1114,6 @@ where
                 .iter()
                 .find(|parsed_pair| parsed_pair.symbol == pair.symbol)
                 .with_context(|| format!("missing parsed pair config for {}", pair.symbol))?;
-            let current_position = state
-                .positions
-                .get(&pair.symbol)
-                .map(|position| position.quantity)
-                .unwrap_or(Decimal::ZERO);
             // Compute pos_ratio for size asymmetry (S2) before generating quotes.
             let pos_ratio = if parsed_pair.max_position_base.is_zero() {
                 Decimal::ZERO
@@ -1135,17 +1170,22 @@ where
                 .filter(|quote| quote.quantity > Decimal::ZERO)
             {
                 // Issue 6: post-fill side cooldown — skip this side for 3 s after a toxic fill.
-                if let Some(&cooled_at) = side_cooldown.get(&(pair.symbol.clone(), quote.side)) {
-                    if cooled_at.elapsed() < Duration::from_secs(3) {
-                        continue;
-                    }
-                }
 
                 // Fix 2: determine if this specific quote is on the unwind side.
                 let is_unwind = match quote.side {
                     Side::Ask => current_position > Decimal::ZERO,
                     Side::Bid => current_position < Decimal::ZERO,
                 };
+                if unwind_only && !is_unwind {
+                    continue;
+                }
+                if !is_unwind {
+                    if let Some(&cooled_at) = side_cooldown.get(&(pair.symbol.clone(), quote.side)) {
+                        if cooled_at.elapsed() < Duration::from_secs(3) {
+                            continue;
+                        }
+                    }
+                }
                 let quote_min_trade_amount = if is_unwind {
                     effective_min_trade_amount
                 } else {
