@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use rust_decimal::{Decimal, MathematicalOps};
+use tracing::debug;
 
 use crate::{
     config::{AppConfig, PairConfig, ParsedConfig, PriceSource},
@@ -14,7 +15,6 @@ pub struct FactorEngine {
     symbol_state: HashMap<String, SymbolFactorState>,
 }
 
-#[derive(Default)]
 struct SymbolFactorState {
     ewma_mean: Option<Decimal>,
     ewma_variance: Decimal,
@@ -29,6 +29,28 @@ struct SymbolFactorState {
     regime_entered_at: Option<DateTime<Utc>>,
     trade_velocity_ewma: Decimal,
     bbo_spread_ewma: Option<Decimal>,
+    /// Consecutive factor cycles where |raw_flow_direction| > 0.7.
+    /// Used as a fallback to force TrendingToxic even when EWMA lags.
+    consecutive_high_raw_flow: u32,
+}
+
+impl Default for SymbolFactorState {
+    fn default() -> Self {
+        Self {
+            ewma_mean: None,
+            ewma_variance: Decimal::ZERO,
+            last_mid: None,
+            last_mid_timestamp: None,
+            vol_history: VecDeque::new(),
+            smoothed_flow: Decimal::ZERO,
+            regime: MarketRegime::Quiet,
+            regime_intensity: Decimal::ZERO,
+            regime_entered_at: Some(Utc::now()),
+            trade_velocity_ewma: Decimal::ZERO,
+            bbo_spread_ewma: None,
+            consecutive_high_raw_flow: 0,
+        }
+    }
 }
 
 impl FactorEngine {
@@ -59,6 +81,7 @@ impl FactorEngine {
                 while symbol_state.vol_history.len() > 512 {
                     symbol_state.vol_history.pop_front();
                 }
+                maybe_shrink_vecdeque(&mut symbol_state.vol_history, "factor_vol_history");
             }
         }
 
@@ -100,6 +123,13 @@ impl FactorEngine {
         } else {
             (buy_volume - sell_volume) / flow_total
         };
+        // Issue 7: track consecutive cycles with strong raw directional pressure.
+        // Used as regime fallback when EWMA hasn't caught up yet.
+        if raw_flow_direction.abs() > Decimal::new(7, 1) {
+            symbol_state.consecutive_high_raw_flow += 1;
+        } else {
+            symbol_state.consecutive_high_raw_flow = 0;
+        }
         let flow_alpha = parsed
             .factors
             .flow_imbalance_weight
@@ -172,8 +202,14 @@ impl FactorEngine {
 
         // S5: Continuous regime intensity + minimum dwell time.
         let flow_abs = (symbol_state.smoothed_flow + cross_flow).abs();
-        let target_regime =
-            candidate_regime(flow_abs, volatility, trade_velocity_ratio, trade_velocity, recent_trade_count);
+        // Issue 7: raw flow fallback — 2 consecutive cycles of |raw_flow| > 0.7
+        // forces TrendingToxic even if the EWMA-smoothed flow hasn't caught up.
+        let force_toxic = symbol_state.consecutive_high_raw_flow >= 2;
+        let target_regime = if force_toxic {
+            MarketRegime::TrendingToxic
+        } else {
+            candidate_regime(flow_abs, volatility, trade_velocity_ratio, trade_velocity, recent_trade_count)
+        };
         let min_dwell = Duration::seconds(parsed.factors.regime_min_dwell_secs as i64);
         let can_change = symbol_state
             .regime_entered_at
@@ -192,8 +228,13 @@ impl FactorEngine {
         let vol_intensity = (volatility / Decimal::new(2, 3)).min(Decimal::ONE);
         let raw_intensity = flow_intensity.max(vol_intensity);
         // EWMA-smooth the intensity to prevent jitter.
-        symbol_state.regime_intensity = Decimal::new(2, 1) * raw_intensity
-            + Decimal::new(8, 1) * symbol_state.regime_intensity;
+        let regime_alpha = parsed.factors.regime_intensity_alpha;
+        symbol_state.regime_intensity = if symbol_state.regime_intensity.is_zero() {
+            raw_intensity
+        } else {
+            regime_alpha * raw_intensity
+                + (Decimal::ONE - regime_alpha) * symbol_state.regime_intensity
+        };
         let regime_intensity = symbol_state.regime_intensity.min(Decimal::ONE).max(Decimal::ZERO);
 
         let time_multiplier = time_of_day_multiplier(now);
@@ -250,6 +291,15 @@ impl FactorEngine {
             regime_intensity,
             ob_imbalance,
         })
+    }
+}
+
+fn maybe_shrink_vecdeque<T>(deque: &mut VecDeque<T>, label: &str) {
+    let len = deque.len();
+    let capacity = deque.capacity();
+    if capacity > len.saturating_mul(2).max(1024) {
+        debug!(label, len, capacity, "shrinking factor VecDeque after burst");
+        deque.shrink_to_fit();
     }
 }
 
@@ -310,8 +360,8 @@ fn candidate_regime(
     let confidence = Decimal::from(recent_trade_count.min(10) as u64) / Decimal::from(10u64);
     let confident_flow = flow_abs * confidence;
 
-    // Directional flow threshold: net imbalance > 60% of volume → toxic trend.
-    if confident_flow > Decimal::new(6, 1) {
+    // Issue 7: lower threshold from 0.6 → 0.35 so the regime fires earlier.
+    if confident_flow > Decimal::new(35, 2) {
         return MarketRegime::TrendingToxic;
     }
     // Volatile: high vol, high velocity ratio vs baseline, OR raw velocity > 1.5 trades/sec

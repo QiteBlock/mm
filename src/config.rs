@@ -46,6 +46,28 @@ impl AppConfig {
         if parsed.runtime.max_orderbook_depth == 0 {
             bail!("runtime.max_orderbook_depth must be > 0");
         }
+        if parsed.model.price_sensitivity_threshold < Decimal::ZERO
+            || parsed.model.price_sensitivity_threshold > Decimal::ONE
+        {
+            bail!("model.price_sensitivity_threshold must be within [0, 1]");
+        }
+        if parsed.model.price_sensitivity_scaling_factor < Decimal::ZERO
+            || parsed.model.price_sensitivity_scaling_factor > Decimal::ONE
+        {
+            bail!("model.price_sensitivity_scaling_factor must be within [0, 1]");
+        }
+        if parsed.factors.regime_intensity_alpha <= Decimal::ZERO
+            || parsed.factors.regime_intensity_alpha > Decimal::ONE
+        {
+            bail!("factors.regime_intensity_alpha must be within (0, 1]");
+        }
+        if parsed.factors.ob_imbalance_depth > parsed.runtime.max_orderbook_depth {
+            bail!(
+                "factors.ob_imbalance_depth ({}) must be <= runtime.max_orderbook_depth ({})",
+                parsed.factors.ob_imbalance_depth,
+                parsed.runtime.max_orderbook_depth
+            );
+        }
         for pair in &parsed.pairs {
             if pair.max_position_base < Decimal::ZERO {
                 bail!(
@@ -215,10 +237,18 @@ impl AppConfig {
                     "factors.ob_imbalance_weight",
                     &self.factors.ob_imbalance_weight,
                 )?,
+                regime_intensity_alpha: parse_decimal(
+                    "factors.regime_intensity_alpha",
+                    &self.factors.regime_intensity_alpha,
+                )?,
                 ob_imbalance_depth: self.factors.ob_imbalance_depth,
                 bbo_spread_cap_bps: parse_decimal(
                     "factors.bbo_spread_cap_bps",
                     &self.factors.bbo_spread_cap_bps,
+                )?,
+                flow_spike_pause_threshold: parse_decimal(
+                    "factors.flow_spike_pause_threshold",
+                    &self.factors.flow_spike_pause_threshold,
                 )?,
             },
             pairs: self
@@ -339,11 +369,16 @@ pub struct ParsedFactorConfig {
     /// How strongly ob_imbalance shifts the reservation price and asymmetric spread/size.
     /// 0 = disabled, 0.5 = moderate, 1.0 = full effect.
     pub ob_imbalance_weight: Decimal,
+    /// EWMA alpha used to smooth regime intensity. 1 = immediate, lower = smoother.
+    pub regime_intensity_alpha: Decimal,
     /// Number of top orderbook levels to sum when computing ob_imbalance (0 = all levels).
     pub ob_imbalance_depth: usize,
     /// Hard cap on BBO spread (in bps) before applying bbo_spread_vol_weight,
     /// preventing momentary wide spreads from inflating the volatility addon.
     pub bbo_spread_cap_bps: Decimal,
+    /// |flow_direction| above this value pauses quoting for the symbol.
+    /// 0 = disabled. Typical: 0.7.
+    pub flow_spike_pause_threshold: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -488,6 +523,14 @@ fn default_bbo_spread_cap_bps() -> String {
     "20".to_string()
 }
 
+fn default_flow_spike_pause_threshold() -> String {
+    "0".to_string() // disabled by default; set to e.g. "0.7" to enable
+}
+
+fn default_regime_intensity_alpha() -> String {
+    "0.2".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub dry_run: bool,
@@ -612,11 +655,16 @@ pub struct FactorConfig {
     pub volatility_floor: String,
     #[serde(default = "default_zero_string")]
     pub ob_imbalance_weight: String,
+    #[serde(default = "default_regime_intensity_alpha")]
+    pub regime_intensity_alpha: String,
     #[serde(default = "default_ob_imbalance_depth")]
     pub ob_imbalance_depth: usize,
     /// Hard cap on BBO spread (bps) before applying bbo_spread_vol_weight.
     #[serde(default = "default_bbo_spread_cap_bps")]
     pub bbo_spread_cap_bps: String,
+    /// |flow_direction| above this threshold pauses quoting. 0 = disabled.
+    #[serde(default = "default_flow_spike_pause_threshold")]
+    pub flow_spike_pause_threshold: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

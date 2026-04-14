@@ -94,6 +94,8 @@ pub struct OpenOrder {
 
 #[derive(Clone, Debug)]
 pub struct Fill {
+    pub order_id: Option<String>,
+    pub nonce: Option<u64>,
     pub symbol: String,
     pub side: Side,
     pub price: Decimal,

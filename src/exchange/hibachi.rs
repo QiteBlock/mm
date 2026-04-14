@@ -860,6 +860,15 @@ fn as_decimal(value: &Value) -> Option<Decimal> {
 
 fn parse_fill(value: &Value) -> Option<Fill> {
     Some(Fill {
+        order_id: value
+            .get("orderId")
+            .or_else(|| value.get("order_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        nonce: value
+            .get("nonce")
+            .or_else(|| value.get("n"))
+            .and_then(Value::as_u64),
         symbol: value.get("symbol")?.as_str()?.to_string(),
         side: parse_fill_side(value)?,
         price: value

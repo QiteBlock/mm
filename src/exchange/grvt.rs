@@ -911,6 +911,12 @@ impl GrvtClient {
         let (mut ws_stream, _) = connect_async(request).await?;
         info!("grvt private websocket connected");
 
+        // Record connect time so we can filter stale fills replayed at reconnect.
+        // GRVT replays recent v1.fill events AND sends a v1.position snapshot on
+        // each reconnect; applying both would double-count the position. We drop
+        // any fill whose exchange timestamp is older than connect_time - 2 s.
+        let connect_time = Utc::now();
+
         self.send_private_snapshot(&sender).await?;
         self.subscribe_private_streams(&mut ws_stream).await?;
 
@@ -920,8 +926,9 @@ impl GrvtClient {
             interval.tick().await; // consume the immediate first tick
             interval
         };
+        // Issue 9: keepalive every 20 s (was 10 s).
         let mut keepalive = {
-            let mut t = tokio::time::interval(Duration::from_secs(10));
+            let mut t = tokio::time::interval(Duration::from_secs(20));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             t.tick().await;
             t
@@ -941,7 +948,21 @@ impl GrvtClient {
                                 warn!(error = %error_message, frame = %text, "grvt private websocket returned error");
                                 continue;
                             }
+                            let stale_cutoff = connect_time - chrono::Duration::seconds(2);
                             for event in parse_grvt_private_events(&text)? {
+                                // Issue 1/9: drop fills replayed from before this connection.
+                                // GRVT replays recent fills on reconnect; the position snapshot
+                                // already accounts for them — applying them again doubles position.
+                                if let PrivateEvent::Fill(ref fill) = event {
+                                    if fill.timestamp < stale_cutoff {
+                                        debug!(
+                                            fill_ts = %fill.timestamp,
+                                            cutoff = %stale_cutoff,
+                                            "dropping stale fill replayed after reconnect"
+                                        );
+                                        continue;
+                                    }
+                                }
                                 sender.send(event).await?;
                             }
                         }
@@ -1465,6 +1486,16 @@ fn parse_grvt_fill(value: &Value) -> Option<crate::domain::Fill> {
     let timestamp = parse_grvt_timestamp(value.get("event_time").or_else(|| value.get("et")))
         .unwrap_or_else(Utc::now);
     Some(crate::domain::Fill {
+        order_id: value
+            .get("order_id")
+            .or_else(|| value.get("oid"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        nonce: value
+            .get("signature")
+            .or_else(|| value.get("sig"))
+            .and_then(|signature| signature.get("nonce").or_else(|| signature.get("n")))
+            .and_then(Value::as_u64),
         symbol: grvt_symbol_to_internal(instrument),
         side: if is_buyer { Side::Bid } else { Side::Ask },
         price,

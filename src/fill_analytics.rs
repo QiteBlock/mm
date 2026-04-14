@@ -15,7 +15,7 @@ fn neutral_score() -> Decimal {
 #[derive(Default)]
 pub struct FillTracker {
     pending: VecDeque<TrackedFill>,
-    scores: HashMap<(String, Side, usize), LevelToxicityScore>,
+    scores: HashMap<String, HashMap<(Side, usize), LevelToxicityScore>>,
 }
 
 impl FillTracker {
@@ -67,21 +67,28 @@ impl FillTracker {
         for (tracked, observed_price, observed_at) in finished {
             let adverse_bps = adverse_bps(tracked.side, tracked.fill_price, observed_price);
             let toxicity_ratio = adverse_bps / tracked.spread_earned_bps.max(Decimal::new(1, 6));
-            let key = (tracked.symbol.clone(), tracked.side, tracked.level_index);
-            let score = self.scores.entry(key).or_default();
+            let score = self
+                .scores
+                .entry(tracked.symbol)
+                .or_default()
+                .entry((tracked.side, tracked.level_index))
+                .or_default();
             score.apply(toxicity_ratio, observed_at);
         }
     }
 
     pub fn decay(&mut self, now: DateTime<Utc>) {
-        for score in self.scores.values_mut() {
-            score.decay(now);
+        for levels in self.scores.values_mut() {
+            for score in levels.values_mut() {
+                score.decay(now);
+            }
         }
     }
 
     pub fn toxicity_score(&self, symbol: &str, side: Side, level_index: usize) -> Decimal {
         self.scores
-            .get(&(symbol.to_string(), side, level_index))
+            .get(symbol)
+            .and_then(|levels| levels.get(&(side, level_index)))
             .map(|score| score.value)
             .unwrap_or_else(neutral_score)
     }
@@ -136,6 +143,10 @@ impl LevelToxicityScore {
         } else {
             0.5f64.powf(elapsed / half_life)
         };
+        if decay.is_nan() || decay.is_infinite() {
+            self.last_updated = Some(now);
+            return;
+        }
         let decay = Decimal::from_f64_retain(decay).unwrap_or(Decimal::ONE);
         let neutral = neutral_score();
         self.value = neutral + (self.value - neutral) * decay;

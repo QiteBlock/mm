@@ -153,11 +153,11 @@ pub fn run_security_checks(
         bail!("open order count limit breached");
     }
 
-    let stale_after_ms = config.runtime.stale_market_data_ms;
-    if let Some(last_market_ts) = state.market.last_updated {
-        let age = Utc::now() - last_market_ts;
-        if age.num_milliseconds() > stale_after_ms {
-            bail!("market data stale for {} ms", age.num_milliseconds());
+    let stale_after_ms = config.runtime.stale_market_data_ms.max(0) as u128;
+    if let Some(last_market_at) = state.market.last_updated_at {
+        let age = last_market_at.elapsed().as_millis();
+        if age > stale_after_ms {
+            bail!("market data stale for {} ms", age);
         }
     } else {
         bail!("no market data available yet");

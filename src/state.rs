@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::Signed;
 use rust_decimal::Decimal;
+use tracing::debug;
 
 use crate::domain::{Fill, MarketEvent, OpenOrder, Position, PrivateEvent, RecentTrade};
 
@@ -188,6 +190,8 @@ impl BotState {
 
             remaining_trade_quantity -= fill_quantity;
             fills.push(Fill {
+                order_id: matched.order_id.clone(),
+                nonce: Some(matched.nonce),
                 symbol: matched.symbol.clone(),
                 side: matched.side,
                 price: matched.price.unwrap_or(price),
@@ -235,11 +239,19 @@ impl BotState {
     fn apply_position_update(&mut self, position: Position) {
         let existing = self.positions.get(&position.symbol).cloned();
         let mut merged = position.clone();
+        // Trust GRVT for quantity and unrealized_pnl (pnl_is_authoritative = true
+        // tells refresh_unrealized_pnl to use merged.unrealized_pnl from the WS).
         merged.pnl_is_authoritative = true;
 
-        if let Some(existing) = existing {
+        if let Some(ref existing) = existing {
             if merged.entry_price.is_zero() && !merged.quantity.is_zero() {
                 merged.entry_price = existing.entry_price;
+            }
+            // Issue 2: GRVT position WS messages don't reliably carry realized_pnl
+            // (the field is often zero or missing).  Always preserve the running
+            // fill-based total we have accumulated ourselves so P&L is not reset.
+            if !existing.realized_pnl.is_zero() {
+                merged.realized_pnl = existing.realized_pnl;
             }
         }
 
@@ -308,6 +320,7 @@ pub struct PnlState {
 pub struct MarketState {
     pub symbols: HashMap<String, SymbolMarketState>,
     pub last_updated: Option<DateTime<Utc>>,
+    pub last_updated_at: Option<Instant>,
     max_orderbook_depth: usize,
 }
 
@@ -316,6 +329,7 @@ impl MarketState {
         Self {
             symbols: HashMap::new(),
             last_updated: None,
+            last_updated_at: None,
             max_orderbook_depth,
         }
     }
@@ -336,6 +350,7 @@ impl MarketState {
                         symbol_state.prev_mid = None;
                         symbol_state.recent_trades.clear();
                         symbol_state.last_updated = None;
+                        symbol_state.last_updated_at = None;
                     }
                 }
             }
@@ -348,7 +363,9 @@ impl MarketState {
                 symbol_state.prev_mid = symbol_state.mid_price();
                 symbol_state.mark_price = Some(price);
                 symbol_state.last_updated = Some(timestamp);
+                symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
+                self.last_updated_at = Some(Instant::now());
             }
             MarketEvent::SpotPrice {
                 symbol,
@@ -358,7 +375,9 @@ impl MarketState {
                 let symbol_state = self.symbols.entry(symbol).or_default();
                 symbol_state.spot_price = Some(price);
                 symbol_state.last_updated = Some(timestamp);
+                symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
+                self.last_updated_at = Some(Instant::now());
             }
             MarketEvent::BestBidAsk {
                 symbol,
@@ -371,7 +390,9 @@ impl MarketState {
                 symbol_state.best_bid = Some(bid);
                 symbol_state.best_ask = Some(ask);
                 symbol_state.last_updated = Some(timestamp);
+                symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
+                self.last_updated_at = Some(Instant::now());
             }
             MarketEvent::Trade {
                 symbol,
@@ -391,8 +412,11 @@ impl MarketState {
                 while symbol_state.recent_trades.len() > MAX_RECENT_TRADES {
                     symbol_state.recent_trades.pop_front();
                 }
+                maybe_shrink_recent_trades(&mut symbol_state.recent_trades);
                 symbol_state.last_updated = Some(timestamp);
+                symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
+                self.last_updated_at = Some(Instant::now());
             }
             MarketEvent::OrderBookSnapshot {
                 symbol,
@@ -406,7 +430,9 @@ impl MarketState {
                 prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
                 prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
                 symbol_state.last_updated = Some(timestamp);
+                symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
+                self.last_updated_at = Some(Instant::now());
             }
             MarketEvent::OrderBookUpdate {
                 symbol,
@@ -432,7 +458,9 @@ impl MarketState {
                 prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
                 prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
                 symbol_state.last_updated = Some(timestamp);
+                symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
+                self.last_updated_at = Some(Instant::now());
             }
         }
     }
@@ -451,6 +479,7 @@ pub struct SymbolMarketState {
     pub prev_mid: Option<Decimal>,
     pub recent_trades: VecDeque<RecentTrade>,
     pub last_updated: Option<DateTime<Utc>>,
+    pub last_updated_at: Option<Instant>,
 }
 
 impl SymbolMarketState {
@@ -480,6 +509,15 @@ pub fn prune_book_depth(book: &mut BTreeMap<Decimal, Decimal>, max_depth: usize,
         return;
     }
 
+    let removed_levels = book.len().saturating_sub(max_depth);
+    debug!(
+        descending,
+        max_depth,
+        removed_levels,
+        original_depth = book.len(),
+        "pruning orderbook depth"
+    );
+
     let retained = if descending {
         book.iter()
             .rev()
@@ -496,5 +534,14 @@ pub fn prune_book_depth(book: &mut BTreeMap<Decimal, Decimal>, max_depth: usize,
     book.clear();
     for (price, quantity) in retained {
         book.insert(price, quantity);
+    }
+}
+
+fn maybe_shrink_recent_trades(trades: &mut VecDeque<RecentTrade>) {
+    let len = trades.len();
+    let capacity = trades.capacity();
+    if capacity > len.saturating_mul(2).max(2_048) {
+        debug!(len, capacity, "shrinking recent_trades after burst");
+        trades.shrink_to_fit();
     }
 }

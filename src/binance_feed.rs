@@ -55,6 +55,7 @@ pub async fn stream_binance_spot_prices(
         .iter()
         .map(|(grvt, binance)| (binance.to_lowercase(), grvt.clone()))
         .collect();
+    let reconnect_symbols: Vec<String> = symbol_map.keys().cloned().collect();
 
     // Build native-tls connector once; reuse across reconnects.
     let tls_connector = match native_tls::TlsConnector::builder().build() {
@@ -86,10 +87,16 @@ pub async fn stream_binance_spot_prices(
                         Some(Ok(msg)) => msg,
                         Some(Err(e)) => {
                             warn!(err = %e, "Binance WS error; reconnecting");
+                            let _ = sender.try_send(MarketEvent::StreamReconnected {
+                                symbols: reconnect_symbols.clone(),
+                            });
                             break;
                         }
                         None => {
                             warn!("Binance WS closed; reconnecting");
+                            let _ = sender.try_send(MarketEvent::StreamReconnected {
+                                symbols: reconnect_symbols.clone(),
+                            });
                             break;
                         }
                     };
@@ -117,6 +124,9 @@ pub async fn stream_binance_spot_prices(
                     }
 
                     if needs_reconnect {
+                        let _ = sender.try_send(MarketEvent::StreamReconnected {
+                            symbols: reconnect_symbols.clone(),
+                        });
                         break;
                     }
 
@@ -132,6 +142,9 @@ pub async fn stream_binance_spot_prices(
             }
             Err(e) => {
                 warn!(err = %e, "Binance WS connect failed; retrying");
+                let _ = sender.try_send(MarketEvent::StreamReconnected {
+                    symbols: reconnect_symbols.clone(),
+                });
             }
         }
         tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;

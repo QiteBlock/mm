@@ -100,6 +100,7 @@ volatility_floor = "0.0005"
 ob_imbalance_weight = "3.0"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
+flow_spike_pause_threshold = "0.7"
 
 [storage]
 enabled = true

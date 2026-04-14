@@ -164,6 +164,15 @@ impl ExtendedClient {
             .await?
             .json()
             .await?;
+        let api_public_key =
+            Felt::from_hex(&response.data.l2_key).context("invalid Extended l2Key public key hex")?;
+        if api_public_key != derived_public_key {
+            bail!(
+                "Extended private_key does not match account l2Key from API management (derived={}, api={})",
+                derived_public_key.to_hex_string(),
+                response.data.l2_key
+            );
+        }
 
         let vault = if self.config.account_id != 0 {
             self.config.account_id
@@ -177,7 +186,7 @@ impl ExtendedClient {
         let identity = ExtendedAccountIdentity {
             vault,
             public_key_hex: response.data.l2_key,
-            derived_public_key,
+            public_key: api_public_key,
             private_key,
         };
         *self.account_cache.write().await = Some(identity.clone());
@@ -376,14 +385,27 @@ impl ExtendedClient {
             .with_context(|| format!("Extended order for {} is missing price", request.symbol))?;
         let expiry = Utc::now() + ChronoDuration::hours(1);
         let expiry_epoch_millis = expiry.timestamp_millis();
-        let settlement_expiration = (expiry + ChronoDuration::days(14)).timestamp();
+        let settlement_expiration =
+            ceil_timestamp_millis_to_seconds((expiry + ChronoDuration::days(14)).timestamp_millis());
+        let min_order_size = parse_decimal_string(&market.trading_config.min_order_size)?;
+        let min_order_size_change =
+            parse_decimal_string(&market.trading_config.min_order_size_change)?;
         let fee_rate = if request.post_only {
             maker_fee_rate
         } else {
             taker_fee_rate
         };
         let nonce = generate_extended_nonce();
-        let synthetic_amount = request.quantity.abs();
+        let synthetic_amount =
+            quantize_down_to_step(request.quantity.abs(), min_order_size_change)?;
+        if synthetic_amount < min_order_size {
+            bail!(
+                "Extended order quantity {} is below market minimum {} for {}",
+                synthetic_amount,
+                min_order_size,
+                request.symbol
+            );
+        }
         let collateral_amount = synthetic_amount * price;
         let total_fee = fee_rate * collateral_amount;
         let is_buy = request.side == Side::Bid;
@@ -452,7 +474,7 @@ impl ExtendedClient {
         };
         let domain = extended_starknet_domain(&self.config.api_base_url);
         let msg_hash = order
-            .message_hash(&domain, account.derived_public_key)
+            .message_hash(&domain, account.public_key)
             .map_err(|err| anyhow::anyhow!("failed to hash Extended order message: {err}"))?;
         let signature = sign_message(&msg_hash, &account.private_key)
             .map_err(|err| anyhow::anyhow!("failed to sign Extended order: {err}"))?;
@@ -468,7 +490,7 @@ impl ExtendedClient {
                 Side::Bid => "BUY",
                 Side::Ask => "SELL",
             },
-            "qty": format_decimal(request.quantity.abs()),
+            "qty": format_decimal(synthetic_amount),
             "price": format_decimal(price),
             "reduceOnly": false,
             "postOnly": request.post_only,
@@ -708,12 +730,16 @@ impl OrderExecutor for ExtendedClient {
             )?;
             let response = self
                 .request_policy
-                .send_with_retry(&self.rest_governor, "extended_place_order", || {
+                .send_with_retry_allow_status(
+                    &self.rest_governor,
+                    "extended_place_order",
+                    || {
                     self.http
                         .post(self.endpoint("/api/v1/user/order"))
                         .json(&payload)
                         .send()
-                })
+                    },
+                )
                 .await?;
             if !response.status().is_success() {
                 let status = response.status();
@@ -1034,6 +1060,17 @@ fn parse_extended_fill_value(value: &Value) -> Option<Fill> {
     )
     .unwrap_or_else(Utc::now);
     Some(Fill {
+        order_id: value
+            .get("id")
+            .or_else(|| value.get("orderId"))
+            .and_then(|id| {
+                id.as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| id.as_u64().map(|v| v.to_string()))
+            }),
+        nonce: value
+            .get("nonce")
+            .and_then(|nonce| nonce.as_u64().or_else(|| nonce.as_str()?.parse::<u64>().ok())),
         symbol,
         side,
         price,
@@ -1109,6 +1146,23 @@ fn round_stark_amount(
         .with_context(|| format!("unable to convert scaled amount {scaled} to integer"))
 }
 
+fn quantize_down_to_step(value: Decimal, step: Decimal) -> Result<Decimal> {
+    if step <= Decimal::ZERO {
+        bail!("Extended quantity step must be positive, got {step}");
+    }
+    Ok(((value / step).floor() * step).normalize())
+}
+
+fn ceil_timestamp_millis_to_seconds(timestamp_millis: i64) -> i64 {
+    let seconds = timestamp_millis.div_euclid(1000);
+    let remainder = timestamp_millis.rem_euclid(1000);
+    if remainder == 0 {
+        seconds
+    } else {
+        seconds + 1
+    }
+}
+
 fn generate_extended_nonce() -> i64 {
     let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
     nanos.rem_euclid(i64::from(i32::MAX - 1)) + 1
@@ -1163,7 +1217,7 @@ struct ExtendedResponse<T> {
 struct ExtendedAccountIdentity {
     vault: u64,
     public_key_hex: String,
-    derived_public_key: Felt,
+    public_key: Felt,
     private_key: Felt,
 }
 
@@ -1198,6 +1252,7 @@ struct ExtendedMarketStats {
 #[serde(rename_all = "camelCase")]
 struct ExtendedTradingConfig {
     min_order_size: String,
+    min_order_size_change: String,
     min_price_change: String,
 }
 
