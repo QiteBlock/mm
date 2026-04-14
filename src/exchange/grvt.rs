@@ -911,13 +911,8 @@ impl GrvtClient {
         let (mut ws_stream, _) = connect_async(request).await?;
         info!("grvt private websocket connected");
 
-        // Record connect time so we can filter stale fills replayed at reconnect.
-        // GRVT replays recent v1.fill events AND sends a v1.position snapshot on
-        // each reconnect; applying both would double-count the position. We drop
-        // any fill whose exchange timestamp is older than connect_time - 2 s.
-        let connect_time = Utc::now();
-
         self.send_private_snapshot(&sender).await?;
+        let replay_fill_cutoff = Utc::now();
         self.subscribe_private_streams(&mut ws_stream).await?;
 
         let mut snapshot_interval = {
@@ -948,17 +943,17 @@ impl GrvtClient {
                                 warn!(error = %error_message, frame = %text, "grvt private websocket returned error");
                                 continue;
                             }
-                            let stale_cutoff = connect_time - chrono::Duration::seconds(2);
+                            let replay_cutoff = replay_fill_cutoff;
                             for event in parse_grvt_private_events(&text)? {
                                 // Issue 1/9: drop fills replayed from before this connection.
                                 // GRVT replays recent fills on reconnect; the position snapshot
                                 // already accounts for them — applying them again doubles position.
                                 if let PrivateEvent::Fill(ref fill) = event {
-                                    if fill.timestamp < stale_cutoff {
+                                    if fill.timestamp <= replay_cutoff {
                                         debug!(
                                             fill_ts = %fill.timestamp,
-                                            cutoff = %stale_cutoff,
-                                            "dropping stale fill replayed after reconnect"
+                                            cutoff = %replay_cutoff,
+                                            "dropping replayed fill after reconnect snapshot"
                                         );
                                         continue;
                                     }
@@ -1462,7 +1457,13 @@ fn parse_grvt_position(value: &Value) -> Option<Position> {
             .or_else(|| value.get("unrealised_pnl"))
             .and_then(as_decimal)
             .unwrap_or(Decimal::ZERO),
-        pnl_is_authoritative: true,
+        pnl_is_authoritative: value
+            .get("realized_pnl")
+            .or_else(|| value.get("rp"))
+            .or_else(|| value.get("realised_pnl"))
+            .and_then(as_decimal)
+            .map(|pnl| !pnl.is_zero())
+            .unwrap_or(false),
     })
 }
 

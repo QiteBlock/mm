@@ -239,18 +239,18 @@ impl BotState {
     fn apply_position_update(&mut self, position: Position) {
         let existing = self.positions.get(&position.symbol).cloned();
         let mut merged = position.clone();
-        // Trust GRVT for quantity and unrealized_pnl (pnl_is_authoritative = true
-        // tells refresh_unrealized_pnl to use merged.unrealized_pnl from the WS).
-        merged.pnl_is_authoritative = true;
 
         if let Some(ref existing) = existing {
             if merged.entry_price.is_zero() && !merged.quantity.is_zero() {
                 merged.entry_price = existing.entry_price;
             }
-            // Issue 2: GRVT position WS messages don't reliably carry realized_pnl
-            // (the field is often zero or missing).  Always preserve the running
-            // fill-based total we have accumulated ourselves so P&L is not reset.
-            if !existing.realized_pnl.is_zero() {
+            if !merged.pnl_is_authoritative {
+                merged.unrealized_pnl = existing.unrealized_pnl;
+            }
+            // GRVT position WS messages often omit realized_pnl or send zero.
+            // Preserve the running fill-based total unless the venue explicitly
+            // provided an authoritative realized P&L value for this update.
+            if !merged.pnl_is_authoritative && !existing.realized_pnl.is_zero() {
                 merged.realized_pnl = existing.realized_pnl;
             }
         }
