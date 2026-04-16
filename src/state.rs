@@ -1,15 +1,20 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::Signed;
 use rust_decimal::Decimal;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::domain::{Fill, MarketEvent, OpenOrder, Position, PrivateEvent, RecentTrade};
 
 pub const MAX_RECENT_TRADES: usize = 10_000;
 const MAX_FILL_HISTORY: usize = 10_000;
+
+/// How long after a stream reconnect to ignore position-snapshot WS updates.
+/// Fills are processed first (they arrive before position snapshots); the settle
+/// window prevents a stale position snapshot from overwriting the fill-derived qty.
+const POSITION_SETTLE_AFTER_RECONNECT: Duration = Duration::from_secs(5);
 
 pub struct BotState {
     pub market: MarketState,
@@ -21,6 +26,9 @@ pub struct BotState {
     pub account_equity: Decimal,
     pub startup_account_equity: Option<Decimal>,
     maker_fee_rate: Decimal,
+    /// Set to `Some(deadline)` on stream reconnect; position WS updates are
+    /// ignored until the deadline to let fill-replay settle first.
+    position_settle_until: Option<Instant>,
 }
 
 impl BotState {
@@ -35,6 +43,7 @@ impl BotState {
             account_equity: Decimal::ZERO,
             startup_account_equity: None,
             maker_fee_rate,
+            position_settle_until: None,
         }
     }
 
@@ -47,6 +56,9 @@ impl BotState {
         match event {
             PrivateEvent::StreamReconnected => {
                 self.open_orders.clear();
+                self.position_settle_until =
+                    Some(Instant::now() + POSITION_SETTLE_AFTER_RECONNECT);
+                debug!("position settle window started after stream reconnect");
             }
             PrivateEvent::OpenOrders(orders) => {
                 self.open_orders.clear();
@@ -237,7 +249,43 @@ impl BotState {
     }
 
     fn apply_position_update(&mut self, position: Position) {
+        // Ignore position snapshots during the settle window after a reconnect.
+        // Fills are replayed first; this prevents a stale snapshot from
+        // overwriting the fill-derived quantity.
+        if self
+            .position_settle_until
+            .map(|deadline| Instant::now() < deadline)
+            .unwrap_or(false)
+        {
+            warn!(
+                symbol = %position.symbol,
+                "ignoring position WS update during reconnect settle window"
+            );
+            return;
+        }
+
         let existing = self.positions.get(&position.symbol).cloned();
+
+        // Delta sanity check: skip implausibly large jumps that look like
+        // stale position snapshots arriving after fills have already been applied.
+        if let Some(ref existing) = existing {
+            let delta = (position.quantity - existing.quantity).abs();
+            let max_recent_fill = self
+                .fills
+                .iter()
+                .map(|f| f.quantity.abs())
+                .fold(Decimal::ZERO, |acc, q| acc.max(q));
+            if !max_recent_fill.is_zero() && delta > max_recent_fill * Decimal::from(2u64) {
+                warn!(
+                    symbol = %position.symbol,
+                    delta = %delta,
+                    max_recent_fill = %max_recent_fill,
+                    "position delta sanity check failed; skipping stale position update"
+                );
+                return;
+            }
+        }
+
         let mut merged = position.clone();
 
         if let Some(ref existing) = existing {

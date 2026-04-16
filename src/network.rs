@@ -197,10 +197,16 @@ impl RequestPolicy {
         const STABLE_CONNECTION_SECS: u64 = 30;
         const WS_MAX_BACKOFF_SECS: u64 = 60;
 
+        // Per-stream jitter: 0-3 s based on stream_name hash so concurrent streams
+        // (market, trades, OB, private …) don't all reconnect simultaneously
+        // (thundering herd → 58K circuit-breaker trips observed in production).
+        let jitter_ms = stream_name_jitter_ms(stream_name);
+
         let mut current_backoff = self.websocket_reconnect_backoff;
 
         loop {
             let connect_start = Instant::now();
+            let mut extra_delay = TokioDuration::ZERO;
             match run_once().await {
                 Ok(()) => {
                     warn!(
@@ -209,12 +215,30 @@ impl RequestPolicy {
                     );
                 }
                 Err(err) => {
-                    warn!(
-                        stream = stream_name,
-                        error = %err,
-                        ?current_backoff,
-                        "websocket loop failed; reconnecting"
-                    );
+                    // Bug 1b: if the server returned a 429 / Too-Many-Requests during
+                    // the WebSocket handshake, honour the implied back-off.  Tungstenite
+                    // surfaces this as an HTTP error in the error string; we detect it
+                    // heuristically and wait an extra 10 s (conservative but safe).
+                    let err_str = err.to_string();
+                    if err_str.contains("429")
+                        || err_str.to_ascii_lowercase().contains("too many requests")
+                        || err_str.to_ascii_lowercase().contains("rate limit")
+                    {
+                        extra_delay = TokioDuration::from_secs(10);
+                        warn!(
+                            stream = stream_name,
+                            error = %err,
+                            extra_delay_secs = 10,
+                            "websocket 429 / rate-limit during handshake; applying extra back-off"
+                        );
+                    } else {
+                        warn!(
+                            stream = stream_name,
+                            error = %err,
+                            ?current_backoff,
+                            "websocket loop failed; reconnecting"
+                        );
+                    }
                 }
             }
 
@@ -229,10 +253,23 @@ impl RequestPolicy {
             }
 
             on_reconnect().await?;
-            warn!(stream = stream_name, ?current_backoff, "websocket reconnect backoff");
-            sleep(current_backoff).await;
+            let total_delay = current_backoff + TokioDuration::from_millis(jitter_ms) + extra_delay;
+            warn!(stream = stream_name, ?total_delay, "websocket reconnect back-off");
+            sleep(total_delay).await;
         }
     }
+}
+
+/// Derive a stable per-stream jitter (0-3000 ms) from the stream name so
+/// concurrent streams don't all reconnect at the same instant.
+fn stream_name_jitter_ms(name: &str) -> u64 {
+    // Simple FNV-1a hash → modulo 3000 ms
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % 3000
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {

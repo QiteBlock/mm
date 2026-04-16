@@ -1038,7 +1038,13 @@ fn parse_extended_position(position: &ExtendedPosition) -> Option<Position> {
         entry_price: position.open_price.parse().ok()?,
         realized_pnl: position.realised_pnl.parse().ok().unwrap_or(Decimal::ZERO),
         unrealized_pnl: position.unrealised_pnl.parse().ok().unwrap_or(Decimal::ZERO),
-        pnl_is_authoritative: true,
+        // Only authoritative when the venue actually sends a non-zero realized_pnl.
+        pnl_is_authoritative: position
+            .realised_pnl
+            .parse::<Decimal>()
+            .ok()
+            .map(|pnl| !pnl.is_zero())
+            .unwrap_or(false),
     })
 }
 

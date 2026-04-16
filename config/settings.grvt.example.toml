@@ -27,6 +27,7 @@ retry_initial_backoff_ms = 250
 retry_max_backoff_ms = 2000
 websocket_reconnect_backoff_ms = 1000
 
+
 [model]
 born_inf_bps = "1"
 born_sup_bps = "5"
@@ -57,7 +58,7 @@ as_vol_cap = "0.001"
 [risk]
 max_abs_position_usd = "300"
 max_symbol_position_usd = "300"
-max_drawdown_usd = "15"
+max_drawdown_usd = "25"
 max_open_orders = 20
 emergency_widening_bps = "3"
 circuit_breaker_cooldown_ms = 3000
@@ -72,7 +73,7 @@ n_trade_quote_threshold = 0
 volatility_ewma_alpha = "0.2"
 volatility_spread_weight = "30"
 inventory_skew_weight = "2.5"
-volume_size_weight = "0.015"
+volume_size_weight = "0.005"
 flow_imbalance_weight = "0.15"
 trade_velocity_alpha = "0.35"
 trade_velocity_burst_threshold = "2"
@@ -85,7 +86,7 @@ volatility_floor = "0.0003"
 ob_imbalance_weight = "3.0"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
-flow_spike_pause_threshold = "0.6"
+flow_spike_pause_threshold = "0.8"
 
 [storage]
 enabled = true
@@ -94,7 +95,7 @@ db_path = "data/fills-grvt-real.db"
 [[pairs]]
 symbol = "HYPE/USDT-P"
 enabled = true
-max_position_base = "5"
+max_position_base = "2"
 price_source = "mid"
 post_only = true
 service_on = true

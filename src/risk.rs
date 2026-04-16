@@ -133,12 +133,25 @@ pub fn run_security_checks(
             .symbols
             .get(&position.symbol)
             .and_then(|symbol| symbol.mark_price.or_else(|| symbol.mid_price()));
+        // Price grace period: if mark is momentarily absent (e.g. WS reconnect),
+        // fall back to entry_price so a brief gap doesn't trip the circuit breaker.
         let mark = match mark {
             Some(p) if p > Decimal::ZERO => p,
-            _ => bail!(
-                "no price available for position limit check on {}; cannot safely continue",
-                position.symbol
-            ),
+            _ => {
+                if position.entry_price > Decimal::ZERO {
+                    tracing::warn!(
+                        symbol = %position.symbol,
+                        entry_price = %position.entry_price,
+                        "mark price unavailable; using entry price for position limit check"
+                    );
+                    position.entry_price
+                } else {
+                    bail!(
+                        "no price available for position limit check on {}; cannot safely continue",
+                        position.symbol
+                    )
+                }
+            }
         };
         if (position.quantity * mark).abs() > parsed.risk.max_symbol_position_usd {
             bail!("symbol position limit breached for {}", position.symbol);

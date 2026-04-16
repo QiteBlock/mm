@@ -188,6 +188,9 @@ pub struct FactorSnapshot {
     /// Orderbook imbalance [-1, 1]: positive = bid-heavy (upward pressure), negative = ask-heavy.
     /// Leading signal computed from top-N levels of the live orderbook.
     pub ob_imbalance: Decimal,
+    /// Consecutive factor cycles where |flow_direction| exceeded flow_spike_pause_threshold.
+    /// The engine requires ≥ 2 before suppressing quotes to prevent oscillating-flow false positives.
+    pub consecutive_flow_spike: u32,
 }
 
 #[derive(Clone, Debug)]

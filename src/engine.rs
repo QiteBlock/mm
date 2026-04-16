@@ -457,7 +457,7 @@ where
                         continue;
                     }
                     last_breaker_message = None;
-                    info!(
+                    debug!(
                         market_symbols = state.market.symbols.len(),
                         open_orders = state.open_orders.len(),
                         dry_run_orders = state.dry_run_orders.len(),
@@ -577,7 +577,7 @@ where
                     if !self.config.runtime.dry_run
                         && should_cancel_on_adverse_bbo_move(current_orders, &state)
                     {
-                        warn!("current BBO moved by more than 2 bps; cancelling stale resting orders");
+                        info!("current BBO moved by more than 2 bps; cancelling stale resting orders");
                         self.exchange.cancel_all_orders().await?;
                         state.open_orders.clear();
                         last_generation_at = None;
@@ -590,7 +590,7 @@ where
                         &desired,
                     )?;
                     if recon.should_update() {
-                        info!(
+                        debug!(
                             changed_orders = recon.changed_orders,
                             unexpected_orders = recon.result.unexpected_orders,
                             missing_orders = recon.result.missing_orders,
@@ -1044,10 +1044,13 @@ where
                 }
             }
 
-            // Issue 5: flow spike pause — skip quoting when flow is strongly directional.
+            // Flow spike pause — only trigger after ≥ 2 consecutive cycles above the
+            // threshold.  Oscillating flow (e.g. bouncing either side of 0.7) would
+            // otherwise repeatedly cancel exit orders and keep positions stuck.
             let flow_spike_threshold = self.parsed.factors.flow_spike_pause_threshold;
             if flow_spike_threshold > Decimal::ZERO
                 && factor_snapshot.flow_direction.abs() > flow_spike_threshold
+                && factor_snapshot.consecutive_flow_spike >= 2
             {
                 if has_position {
                     warn!(
@@ -1055,7 +1058,8 @@ where
                         position = %current_position,
                         flow_direction = %factor_snapshot.flow_direction,
                         threshold = %flow_spike_threshold,
-                        "flow spike detected while holding position; switching to unwind-only quoting"
+                        consecutive_cycles = factor_snapshot.consecutive_flow_spike,
+                        "sustained flow spike while holding position; switching to unwind-only quoting"
                     );
                     unwind_only = true;
                 } else {
@@ -1063,7 +1067,8 @@ where
                         symbol = %pair.symbol,
                         flow_direction = %factor_snapshot.flow_direction,
                         threshold = %flow_spike_threshold,
-                        "flow spike detected; suppressing quotes"
+                        consecutive_cycles = factor_snapshot.consecutive_flow_spike,
+                        "sustained flow spike; suppressing quotes"
                     );
                     continue;
                 }
@@ -1088,6 +1093,7 @@ where
                 spread_addon = %factor_snapshot.volatility,
                 volume_imbalance = %factor_snapshot.volume_imbalance,
                 flow_direction = %factor_snapshot.flow_direction,
+                consecutive_flow_spike = factor_snapshot.consecutive_flow_spike,
                 ob_imbalance = %factor_snapshot.ob_imbalance,
                 inventory_skew = %factor_snapshot.inventory_skew,
                 recent_trade_count = factor_snapshot.recent_trade_count,
@@ -1264,7 +1270,7 @@ where
                             if floored_qty > Decimal::ZERO && floored_qty <= *remaining_capacity {
                                 quantity = floored_qty;
                             } else {
-                                info!(
+                                debug!(
                                     symbol = %pair.symbol,
                                     side = ?quote.side,
                                     raw_quantity = %quantity,
@@ -1274,7 +1280,7 @@ where
                                 continue;
                             }
                         } else {
-                            info!(
+                            debug!(
                                 symbol = %pair.symbol,
                                 side = ?quote.side,
                                 raw_quantity = %quantity,
@@ -1287,7 +1293,7 @@ where
                         }
                     }
                     *remaining_capacity -= quantity;
-                    info!(
+                    debug!(
                         symbol = %pair.symbol,
                         side = ?quote.side,
                         capped_quantity = %quantity,
@@ -1312,12 +1318,47 @@ where
             }
 
             if symbol_orders.is_empty() && current_position != Decimal::ZERO {
-                warn!(
-                    symbol = %pair.symbol,
-                    position = %current_position,
-                    emergency_unwind,
-                    "zero orders generated for symbol while holding a non-zero position"
-                );
+                // No orders were generated but we hold a position — place a
+                // minimal forced exit order to prevent being stuck indefinitely.
+                // This bypasses flow-spike, vol-cut, and cooldown filters.
+                let exit_side = if current_position > Decimal::ZERO {
+                    Side::Ask
+                } else {
+                    Side::Bid
+                };
+                let exit_price = match exit_side {
+                    Side::Ask => best_bid,
+                    Side::Bid => best_ask,
+                };
+                if let Some(price) = exit_price {
+                    let quantity = instrument.min_order_size.max(current_position.abs());
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        exit_side = ?exit_side,
+                        price = %price,
+                        quantity = %quantity,
+                        emergency_unwind,
+                        "zero orders generated while holding position; placing forced exit order"
+                    );
+                    symbol_orders.push(OrderRequest {
+                        symbol: pair.symbol.clone(),
+                        contract_id: instrument.contract_id,
+                        level_index: 0,
+                        side: exit_side,
+                        order_type: OrderType::Limit,
+                        price: Some(price),
+                        quantity,
+                        post_only: false,
+                    });
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        emergency_unwind,
+                        "zero orders generated for symbol while holding a non-zero position; no BBO available for forced exit"
+                    );
+                }
             }
             clip_symbol_orders_to_bbo(&mut symbol_orders, best_bid, best_ask, instrument.tick_size);
             orders.extend(symbol_orders.iter().cloned());
@@ -2205,7 +2246,7 @@ fn market_reference(
 
 fn log_dry_run_orders(desired: &[OrderRequest]) {
     for order in desired {
-        info!(
+        debug!(
             symbol = %order.symbol,
             level_index = order.level_index,
             side = ?order.side,

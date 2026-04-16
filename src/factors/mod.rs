@@ -32,6 +32,9 @@ struct SymbolFactorState {
     /// Consecutive factor cycles where |raw_flow_direction| > 0.7.
     /// Used as a fallback to force TrendingToxic even when EWMA lags.
     consecutive_high_raw_flow: u32,
+    /// Consecutive factor cycles where |smoothed flow_direction| > flow_spike_pause_threshold.
+    /// Used to require a stable spike before fully suppressing quotes.
+    consecutive_flow_spike: u32,
 }
 
 impl Default for SymbolFactorState {
@@ -49,6 +52,7 @@ impl Default for SymbolFactorState {
             trade_velocity_ewma: Decimal::ZERO,
             bbo_spread_ewma: None,
             consecutive_high_raw_flow: 0,
+            consecutive_flow_spike: 0,
         }
     }
 }
@@ -251,11 +255,23 @@ impl FactorEngine {
             return None;
         }
 
-        // S6: volume_imbalance is now purely volume-based size scaling (always >= 0).
+        // S6: volume_imbalance is purely volume-based size scaling (always >= 0).
         // flow_direction carries the signed directional pressure separately.
+        //
+        // Bug fix: linear scaling (rolling_volume * weight) blew up to 40-50× on
+        // active markets (100+ HYPE/30 s → volume_factor = 46×).  Use sqrt to
+        // compress large volumes, then hard-cap at 1.5 so volume_factor ≤ 2.5×.
         let combined_flow_direction = symbol_state.smoothed_flow + cross_flow;
         let volume_size_addon = rolling_volume * parsed.factors.volume_size_weight;
-        let volume_imbalance = volume_size_addon.max(Decimal::ZERO);
+        let volume_imbalance = if volume_size_addon > Decimal::ZERO {
+            // sqrt(addon) compresses large values naturally; cap at 1.5 → max volume_factor = 2.5×
+            volume_size_addon
+                .sqrt()
+                .unwrap_or(Decimal::ZERO)
+                .min(Decimal::new(15, 1))
+        } else {
+            Decimal::ZERO
+        };
 
         // Orderbook imbalance: leading signal from top-N book levels.
         // ob_imbalance ∈ [-1, 1]: positive = bid-heavy, negative = ask-heavy.
@@ -279,17 +295,30 @@ impl FactorEngine {
             }
         };
 
+        // Track how many consecutive cycles the flow direction has been spiking above
+        // the pause threshold.  We use the same threshold from config so the counter
+        // is always consistent with the pause decision in the engine.
+        let flow_direction_clamped = combined_flow_direction.clamp(-Decimal::ONE, Decimal::ONE);
+        let spike_threshold = parsed.factors.flow_spike_pause_threshold;
+        if spike_threshold > Decimal::ZERO && flow_direction_clamped.abs() > spike_threshold {
+            symbol_state.consecutive_flow_spike += 1;
+        } else {
+            symbol_state.consecutive_flow_spike = 0;
+        }
+        let consecutive_flow_spike = symbol_state.consecutive_flow_spike;
+
         Some(FactorSnapshot {
             price_index,
             raw_volatility: volatility,
             volatility: volatility_addon,
             volume_imbalance,
-            flow_direction: combined_flow_direction.clamp(-Decimal::ONE, Decimal::ONE),
+            flow_direction: flow_direction_clamped,
             inventory_skew,
             recent_trade_count,
             regime,
             regime_intensity,
             ob_imbalance,
+            consecutive_flow_spike,
         })
     }
 }

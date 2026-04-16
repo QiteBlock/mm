@@ -610,7 +610,7 @@ impl GrvtClient {
         let signer = format!("{:#x}", wallet.address());
         let contract_size = grvt_contract_size(quantized_size, instrument.base_decimals)?;
 
-        info!(
+        debug!(
             symbol = %request.symbol,
             side = ?request.side,
             requested_qty = %request.quantity,

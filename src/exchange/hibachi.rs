@@ -941,7 +941,15 @@ fn parse_position(value: &Value) -> Option<Position> {
             .and_then(as_decimal)
             .unwrap_or(Decimal::ZERO),
         unrealized_pnl,
-        pnl_is_authoritative: true,
+        // Only authoritative when the venue actually sends a non-zero realized_pnl.
+        // When the field is absent/zero the engine's fill-math running total wins.
+        pnl_is_authoritative: payload
+            .get("realizedPnl")
+            .or_else(|| payload.get("realized_pnl"))
+            .or_else(|| payload.get("realizedTradingPnl"))
+            .and_then(as_decimal)
+            .map(|pnl| !pnl.is_zero())
+            .unwrap_or(false),
     })
 }
 

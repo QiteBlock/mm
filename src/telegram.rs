@@ -1,11 +1,17 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::{sync::Mutex, time::Instant};
 use tracing::{info, warn};
 
 use crate::config::TelegramConfig;
+
+/// Telegram hard limits: 4096 chars per message, ~30 msgs/sec per bot.
+/// We stay well under with a 40 ms minimum interval (25 msg/sec).
+const MAX_MESSAGE_LEN: usize = 4096;
+const MIN_SEND_INTERVAL: Duration = Duration::from_millis(40);
 
 #[derive(Clone, Debug)]
 pub enum TelegramCommand {
@@ -19,11 +25,13 @@ pub struct TelegramNotifier {
     inner: Option<Arc<TelegramInner>>,
 }
 
-#[derive(Clone)]
 struct TelegramInner {
     client: Client,
     bot_token: String,
     chat_id: String,
+    /// Token-bucket style rate limiter: tracks the earliest time the next
+    /// message may be sent so we stay under Telegram's 30 msg/sec limit.
+    next_send_at: Mutex<Instant>,
 }
 
 impl TelegramNotifier {
@@ -34,6 +42,7 @@ impl TelegramNotifier {
                     client: Client::new(),
                     bot_token: cfg.bot_token,
                     chat_id: cfg.chat_id,
+                    next_send_at: Mutex::new(Instant::now()),
                 })),
             },
             _ => Self::default(),
@@ -45,29 +54,10 @@ impl TelegramNotifier {
             return;
         };
 
-        let request = TelegramMessage {
-            chat_id: inner.chat_id.clone(),
-            text: message.into(),
-        };
-
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            inner.bot_token
-        );
-        match inner.client.post(url).json(&request).send().await {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<failed to read body>".to_string());
-                    warn!(%status, %body, "telegram alert rejected");
-                }
-            }
-            Err(err) => {
-                warn!(?err, "telegram alert failed");
-            }
+        let text = message.into();
+        let chunks = chunk_message(&text);
+        for chunk in chunks {
+            inner.send_chunk(chunk).await;
         }
     }
 
@@ -120,6 +110,69 @@ impl TelegramNotifier {
 
         Ok(commands)
     }
+}
+
+impl TelegramInner {
+    async fn send_chunk(&self, text: String) {
+        // Rate limiting: wait until next_send_at before firing.
+        {
+            let mut next = self.next_send_at.lock().await;
+            let now = Instant::now();
+            if *next > now {
+                tokio::time::sleep_until(*next).await;
+            }
+            *next = Instant::now() + MIN_SEND_INTERVAL;
+        }
+
+        let request = TelegramMessage {
+            chat_id: self.chat_id.clone(),
+            text,
+        };
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            self.bot_token
+        );
+        match self.client.post(url).json(&request).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<failed to read body>".to_string());
+                    warn!(%status, %body, "telegram alert rejected");
+                }
+            }
+            Err(err) => {
+                warn!(?err, "telegram alert failed");
+            }
+        }
+    }
+}
+
+/// Split a message into chunks of at most MAX_MESSAGE_LEN characters,
+/// breaking on newline boundaries where possible.
+fn chunk_message(text: &str) -> Vec<String> {
+    if text.len() <= MAX_MESSAGE_LEN {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let end = (start + MAX_MESSAGE_LEN).min(text.len());
+        // Try to break on the last newline within the window.
+        let split = if end < text.len() {
+            text[start..end]
+                .rfind('\n')
+                .map(|pos| start + pos + 1)
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        chunks.push(text[start..split].to_string());
+        start = split;
+    }
+    chunks
 }
 
 #[derive(Serialize)]
