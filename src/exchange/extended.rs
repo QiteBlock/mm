@@ -82,11 +82,19 @@ impl ExtendedClient {
     }
 
     fn ws_market_endpoint(&self, path: &str) -> String {
-        format!("{}{}", self.config.ws_market_url.trim_end_matches('/'), path)
+        format!(
+            "{}{}",
+            self.config.ws_market_url.trim_end_matches('/'),
+            path
+        )
     }
 
     fn ws_account_endpoint(&self, path: &str) -> String {
-        format!("{}{}", self.config.ws_account_url.trim_end_matches('/'), path)
+        format!(
+            "{}{}",
+            self.config.ws_account_url.trim_end_matches('/'),
+            path
+        )
     }
 
     async fn load_markets_uncached(&self) -> Result<HashMap<String, ExtendedMarket>> {
@@ -159,13 +167,15 @@ impl ExtendedClient {
         let response: ExtendedResponse<ExtendedAccountDetails> = self
             .request_policy
             .send_with_retry(&self.rest_governor, "extended_fetch_account", || {
-                self.http.get(self.endpoint("/api/v1/user/account/info")).send()
+                self.http
+                    .get(self.endpoint("/api/v1/user/account/info"))
+                    .send()
             })
             .await?
             .json()
             .await?;
-        let api_public_key =
-            Felt::from_hex(&response.data.l2_key).context("invalid Extended l2Key public key hex")?;
+        let api_public_key = Felt::from_hex(&response.data.l2_key)
+            .context("invalid Extended l2Key public key hex")?;
         if api_public_key != derived_public_key {
             bail!(
                 "Extended private_key does not match account l2Key from API management (derived={}, api={})",
@@ -268,7 +278,11 @@ impl ExtendedClient {
                                     ws_stream.send(WsMessage::Pong(payload)).await?;
                                 }
                                 Some(Ok(WsMessage::Close(frame))) => {
-                                    warn!(stream = stream_name, ?frame, "extended websocket closed");
+                                    warn!(
+                                        stream = stream_name,
+                                        ?frame,
+                                        "extended websocket closed"
+                                    );
                                     break;
                                 }
                                 Some(Ok(_)) => {}
@@ -283,7 +297,9 @@ impl ExtendedClient {
                     let sender = sender.clone();
                     let symbols = symbols.to_vec();
                     async move {
-                        sender.send(MarketEvent::StreamReconnected { symbols }).await?;
+                        sender
+                            .send(MarketEvent::StreamReconnected { symbols })
+                            .await?;
                         Ok(())
                     }
                 },
@@ -302,10 +318,9 @@ impl ExtendedClient {
             HeaderName::from_static(X_API_KEY),
             HeaderValue::from_str(&self.config.api_key)?,
         );
-        request.headers_mut().insert(
-            USER_AGENT,
-            HeaderValue::from_str(&self.config.user_agent)?,
-        );
+        request
+            .headers_mut()
+            .insert(USER_AGENT, HeaderValue::from_str(&self.config.user_agent)?);
 
         let (mut ws_stream, _) = connect_async(request).await?;
         info!("extended private websocket connected");
@@ -354,18 +369,18 @@ impl ExtendedClient {
     async fn send_private_snapshot(&self, sender: &mpsc::Sender<PrivateEvent>) -> Result<()> {
         let equity = self.fetch_balance_equity().await?;
         info!(equity = %equity, "extended private snapshot balance fetched");
-        sender
-            .send(PrivateEvent::AccountEquity {
-                equity,
-            })
-            .await?;
+        sender.send(PrivateEvent::AccountEquity { equity }).await?;
         let open_orders = self.fetch_open_orders().await?;
-        info!(count = open_orders.len(), "extended private snapshot open orders fetched");
-        sender
-            .send(PrivateEvent::OpenOrders(open_orders))
-            .await?;
+        info!(
+            count = open_orders.len(),
+            "extended private snapshot open orders fetched"
+        );
+        sender.send(PrivateEvent::OpenOrders(open_orders)).await?;
         let positions = self.fetch_positions().await?;
-        info!(count = positions.len(), "extended private snapshot positions fetched");
+        info!(
+            count = positions.len(),
+            "extended private snapshot positions fetched"
+        );
         for position in positions {
             sender.send(PrivateEvent::Position(position)).await?;
         }
@@ -385,8 +400,9 @@ impl ExtendedClient {
             .with_context(|| format!("Extended order for {} is missing price", request.symbol))?;
         let expiry = Utc::now() + ChronoDuration::hours(1);
         let expiry_epoch_millis = expiry.timestamp_millis();
-        let settlement_expiration =
-            ceil_timestamp_millis_to_seconds((expiry + ChronoDuration::days(14)).timestamp_millis());
+        let settlement_expiration = ceil_timestamp_millis_to_seconds(
+            (expiry + ChronoDuration::days(14)).timestamp_millis(),
+        );
         let min_order_size = parse_decimal_string(&market.trading_config.min_order_size)?;
         let min_order_size_change =
             parse_decimal_string(&market.trading_config.min_order_size_change)?;
@@ -459,8 +475,7 @@ impl ExtendedClient {
                 value: Felt::from_hex(&market.l2_config.collateral_id)
                     .context("invalid Extended collateral asset id")?,
             },
-            quote_amount: i64::try_from(quote_amount)
-                .context("Extended quote amount overflow")?,
+            quote_amount: i64::try_from(quote_amount).context("Extended quote amount overflow")?,
             fee_asset_id: AssetId {
                 value: Felt::from_hex(&market.l2_config.collateral_id)
                     .context("invalid Extended fee asset id")?,
@@ -470,7 +485,9 @@ impl ExtendedClient {
                 seconds: u64::try_from(settlement_expiration)
                     .context("Extended settlement expiration overflow")?,
             },
-            salt: u64::try_from(nonce).context("Extended nonce overflow")?.into(),
+            salt: u64::try_from(nonce)
+                .context("Extended nonce overflow")?
+                .into(),
         };
         let domain = extended_starknet_domain(&self.config.api_base_url);
         let msg_hash = order
@@ -525,21 +542,20 @@ impl ExchangeClient for ExtendedClient {
         for symbol in symbols {
             let response = self
                 .request_policy
-                .send_with_retry(
-                    &self.rest_governor,
-                    "extended_market_snapshot",
-                    || {
-                        self.http
-                            .get(self.endpoint("/api/v1/info/markets"))
-                            .query(&[("market", symbol.as_str())])
-                            .send()
-                    },
-                )
+                .send_with_retry(&self.rest_governor, "extended_market_snapshot", || {
+                    self.http
+                        .get(self.endpoint("/api/v1/info/markets"))
+                        .query(&[("market", symbol.as_str())])
+                        .send()
+                })
                 .await;
             let Ok(response) = response else {
                 continue;
             };
-            let Ok(payload) = response.json::<ExtendedResponse<Vec<ExtendedMarket>>>().await else {
+            let Ok(payload) = response
+                .json::<ExtendedResponse<Vec<ExtendedMarket>>>()
+                .await
+            else {
                 continue;
             };
             let Some(market) = payload.data.into_iter().next() else {
@@ -698,7 +714,9 @@ impl PrivateDataSource for ExtendedClient {
         let response: ExtendedResponse<Vec<ExtendedPosition>> = self
             .request_policy
             .send_with_retry(&self.rest_governor, "extended_fetch_positions", || {
-                self.http.get(self.endpoint("/api/v1/user/positions")).send()
+                self.http
+                    .get(self.endpoint("/api/v1/user/positions"))
+                    .send()
             })
             .await?
             .json()
@@ -732,16 +750,12 @@ impl OrderExecutor for ExtendedClient {
             )?;
             let response = self
                 .request_policy
-                .send_with_retry_allow_status(
-                    &self.rest_governor,
-                    "extended_place_order",
-                    || {
+                .send_with_retry_allow_status(&self.rest_governor, "extended_place_order", || {
                     self.http
                         .post(self.endpoint("/api/v1/user/order"))
                         .json(&payload)
                         .send()
-                    },
-                )
+                })
                 .await?;
             if !response.status().is_success() {
                 let status = response.status();
@@ -761,7 +775,10 @@ impl OrderExecutor for ExtendedClient {
                     let endpoint = self.endpoint("/api/v1/user/order");
                     async move {
                         if order_id.parse::<u64>().is_ok() {
-                            self.http.delete(format!("{endpoint}/{order_id}")).send().await
+                            self.http
+                                .delete(format!("{endpoint}/{order_id}"))
+                                .send()
+                                .await
                         } else {
                             self.http
                                 .delete(endpoint)
@@ -801,7 +818,10 @@ impl OrderExecutor for ExtendedClient {
     }
 }
 
-fn parse_extended_mark_price_events(frame: &str, symbols: &HashSet<String>) -> Result<Vec<MarketEvent>> {
+fn parse_extended_mark_price_events(
+    frame: &str,
+    symbols: &HashSet<String>,
+) -> Result<Vec<MarketEvent>> {
     let value: Value = serde_json::from_str(frame)?;
     let Some(data) = value.get("data") else {
         return Ok(Vec::new());
@@ -815,8 +835,7 @@ fn parse_extended_mark_price_events(frame: &str, symbols: &HashSet<String>) -> R
     let Some(price) = data.get("p").and_then(as_decimal) else {
         return Ok(Vec::new());
     };
-    let ts = parse_millis(data.get("ts").and_then(Value::as_i64))
-        .unwrap_or_else(Utc::now);
+    let ts = parse_millis(data.get("ts").and_then(Value::as_i64)).unwrap_or_else(Utc::now);
     Ok(vec![MarketEvent::MarkPrice {
         symbol: symbol.to_string(),
         price,
@@ -824,7 +843,10 @@ fn parse_extended_mark_price_events(frame: &str, symbols: &HashSet<String>) -> R
     }])
 }
 
-fn parse_extended_index_price_events(frame: &str, symbols: &HashSet<String>) -> Result<Vec<MarketEvent>> {
+fn parse_extended_index_price_events(
+    frame: &str,
+    symbols: &HashSet<String>,
+) -> Result<Vec<MarketEvent>> {
     let value: Value = serde_json::from_str(frame)?;
     let Some(data) = value.get("data") else {
         return Ok(Vec::new());
@@ -838,8 +860,7 @@ fn parse_extended_index_price_events(frame: &str, symbols: &HashSet<String>) -> 
     let Some(price) = data.get("p").and_then(as_decimal) else {
         return Ok(Vec::new());
     };
-    let ts = parse_millis(data.get("ts").and_then(Value::as_i64))
-        .unwrap_or_else(Utc::now);
+    let ts = parse_millis(data.get("ts").and_then(Value::as_i64)).unwrap_or_else(Utc::now);
     Ok(vec![MarketEvent::SpotPrice {
         symbol: symbol.to_string(),
         price,
@@ -920,7 +941,10 @@ fn parse_extended_trade_events(frame: &str, symbols: &HashSet<String>) -> Result
     Ok(events)
 }
 
-fn parse_extended_orderbook_events(frame: &str, symbols: &HashSet<String>) -> Result<Vec<MarketEvent>> {
+fn parse_extended_orderbook_events(
+    frame: &str,
+    symbols: &HashSet<String>,
+) -> Result<Vec<MarketEvent>> {
     let value: Value = serde_json::from_str(frame)?;
     let Some(data) = value.get("data") else {
         return Ok(Vec::new());
@@ -934,7 +958,10 @@ fn parse_extended_orderbook_events(frame: &str, symbols: &HashSet<String>) -> Re
     let bids = parse_extended_levels(data.get("b"));
     let asks = parse_extended_levels(data.get("a"));
     let ts = parse_millis(value.get("ts").and_then(Value::as_i64)).unwrap_or_else(Utc::now);
-    let kind = value.get("type").and_then(Value::as_str).unwrap_or("UPDATE");
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("UPDATE");
     let event = if kind.eq_ignore_ascii_case("SNAPSHOT") {
         MarketEvent::OrderBookSnapshot {
             symbol: symbol.to_string(),
@@ -1041,7 +1068,11 @@ fn parse_extended_position(position: &ExtendedPosition) -> Option<Position> {
         quantity: size * side.sign(),
         entry_price: position.open_price.parse().ok()?,
         realized_pnl: position.realised_pnl.parse().ok().unwrap_or(Decimal::ZERO),
-        unrealized_pnl: position.unrealised_pnl.parse().ok().unwrap_or(Decimal::ZERO),
+        unrealized_pnl: position
+            .unrealised_pnl
+            .parse()
+            .ok()
+            .unwrap_or(Decimal::ZERO),
         // Only authoritative when the venue actually sends a non-zero realized_pnl.
         pnl_is_authoritative: position
             .realised_pnl
@@ -1053,14 +1084,24 @@ fn parse_extended_position(position: &ExtendedPosition) -> Option<Position> {
 }
 
 fn parse_extended_fill_value(value: &Value) -> Option<Fill> {
-    let symbol = value.get("market").or_else(|| value.get("m"))?.as_str()?.to_string();
+    let symbol = value
+        .get("market")
+        .or_else(|| value.get("m"))?
+        .as_str()?
+        .to_string();
     let side = value
         .get("side")
         .or_else(|| value.get("S"))
         .and_then(Value::as_str)
         .and_then(parse_side)?;
-    let price = value.get("price").or_else(|| value.get("p")).and_then(as_decimal)?;
-    let quantity = value.get("qty").or_else(|| value.get("q")).and_then(as_decimal)?;
+    let price = value
+        .get("price")
+        .or_else(|| value.get("p"))
+        .and_then(as_decimal)?;
+    let quantity = value
+        .get("qty")
+        .or_else(|| value.get("q"))
+        .and_then(as_decimal)?;
     let timestamp = parse_millis(
         value
             .get("createdTime")
@@ -1078,9 +1119,11 @@ fn parse_extended_fill_value(value: &Value) -> Option<Fill> {
                     .map(ToString::to_string)
                     .or_else(|| id.as_u64().map(|v| v.to_string()))
             }),
-        nonce: value
-            .get("nonce")
-            .and_then(|nonce| nonce.as_u64().or_else(|| nonce.as_str()?.parse::<u64>().ok())),
+        nonce: value.get("nonce").and_then(|nonce| {
+            nonce
+                .as_u64()
+                .or_else(|| nonce.as_str()?.parse::<u64>().ok())
+        }),
         symbol,
         side,
         price,

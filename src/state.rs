@@ -56,8 +56,7 @@ impl BotState {
         match event {
             PrivateEvent::StreamReconnected => {
                 self.open_orders.clear();
-                self.position_settle_until =
-                    Some(Instant::now() + POSITION_SETTLE_AFTER_RECONNECT);
+                self.position_settle_until = Some(Instant::now() + POSITION_SETTLE_AFTER_RECONNECT);
                 debug!("position settle window started after stream reconnect");
             }
             PrivateEvent::OpenOrders(orders) => {
@@ -332,10 +331,9 @@ impl BotState {
         } else {
             let closed_quantity = previous_quantity.abs().min(fill_quantity.abs());
             if !position.pnl_is_authoritative {
-                position.realized_pnl +=
-                    (fill.price - position.entry_price)
-                        * closed_quantity
-                        * previous_quantity.signum();
+                position.realized_pnl += (fill.price - position.entry_price)
+                    * closed_quantity
+                    * previous_quantity.signum();
             }
 
             if new_quantity.is_zero() {

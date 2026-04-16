@@ -6,7 +6,9 @@ use market_making::{
     config::{AppConfig, ExchangeKind},
     control::RuntimeControl,
     engine::MarketMakingEngine,
-    exchange::{extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient, AnyExchangeClient},
+    exchange::{
+        extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient, AnyExchangeClient,
+    },
     storage::FillStore,
     telegram::{TelegramCommand, TelegramNotifier},
 };
@@ -37,10 +39,9 @@ async fn main() -> Result<()> {
         ExchangeKind::Grvt => {
             AnyExchangeClient::Grvt(GrvtClient::new(config.venue.clone(), &config.network)?)
         }
-        ExchangeKind::Extended => AnyExchangeClient::Extended(ExtendedClient::new(
-            config.venue.clone(),
-            &config.network,
-        )?),
+        ExchangeKind::Extended => {
+            AnyExchangeClient::Extended(ExtendedClient::new(config.venue.clone(), &config.network)?)
+        }
     });
     let fill_store = Arc::new(FillStore::from_config(config.storage.as_ref())?);
     let control = Arc::new(RuntimeControl::default());

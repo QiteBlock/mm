@@ -128,7 +128,12 @@ impl HealthTracker {
     }
 
     /// Update global empty-quote counter. Returns true if the alert threshold was just crossed.
-    fn update_empty_cycles(&mut self, orders_generated: usize, has_position: bool, threshold: usize) -> bool {
+    fn update_empty_cycles(
+        &mut self,
+        orders_generated: usize,
+        has_position: bool,
+        threshold: usize,
+    ) -> bool {
         if orders_generated == 0 && has_position {
             self.consecutive_empty_cycles += 1;
             self.consecutive_empty_cycles == threshold
@@ -139,9 +144,18 @@ impl HealthTracker {
     }
 
     /// Update per-symbol empty-unwind counter. Returns true when emergency unwind should activate.
-    fn update_unwind_cycles(&mut self, symbol: &str, unwind_orders: usize, over_threshold: bool, emergency_cycles: usize) -> bool {
+    fn update_unwind_cycles(
+        &mut self,
+        symbol: &str,
+        unwind_orders: usize,
+        over_threshold: bool,
+        emergency_cycles: usize,
+    ) -> bool {
         if unwind_orders == 0 && over_threshold {
-            let count = self.empty_unwind_cycles.entry(symbol.to_string()).or_insert(0);
+            let count = self
+                .empty_unwind_cycles
+                .entry(symbol.to_string())
+                .or_insert(0);
             *count += 1;
             *count >= emergency_cycles
         } else {
@@ -242,7 +256,10 @@ where
         info!(symbols = ?market_symbols, "engine enabled market symbols");
 
         let initial_orders = self.exchange.fetch_open_orders().await?;
-        info!(count = initial_orders.len(), "engine initial open orders fetched");
+        info!(
+            count = initial_orders.len(),
+            "engine initial open orders fetched"
+        );
         let (market_tx, mut market_rx) = mpsc::channel(1024);
         let (private_tx, mut private_rx) = mpsc::channel(512);
         info!("engine spawning all streams");
@@ -888,12 +905,22 @@ where
             .map(|position| position.quantity.is_zero())
             .unwrap_or(true)
         {
-            if let Some(reference_price) = state.market.symbols.get(&fill.symbol).and_then(|market| {
-                match fill.side {
-                    Side::Bid => market.best_ask.or_else(|| market.mark_price).or_else(|| market.mid_price()),
-                    Side::Ask => market.best_bid.or_else(|| market.mark_price).or_else(|| market.mid_price()),
-                }
-            }) {
+            if let Some(reference_price) =
+                state
+                    .market
+                    .symbols
+                    .get(&fill.symbol)
+                    .and_then(|market| match fill.side {
+                        Side::Bid => market
+                            .best_ask
+                            .or_else(|| market.mark_price)
+                            .or_else(|| market.mid_price()),
+                        Side::Ask => market
+                            .best_bid
+                            .or_else(|| market.mark_price)
+                            .or_else(|| market.mid_price()),
+                    })
+            {
                 fill_tracker.observe_price(&fill.symbol, reference_price, fill.timestamp);
             }
         }
@@ -996,11 +1023,9 @@ where
         // internally; we never propagate them to the engine loop.
         let binance_sender = market_sender.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::binance_feed::stream_binance_spot_prices(
-                binance_symbol_map,
-                binance_sender,
-            )
-            .await
+            if let Err(e) =
+                crate::binance_feed::stream_binance_spot_prices(binance_symbol_map, binance_sender)
+                    .await
             {
                 tracing::warn!(err = %e, "binance feed task exited unexpectedly");
             }
@@ -1049,13 +1074,15 @@ where
             let now_inst = Instant::now();
             let widen_mult = self.parsed.model.post_fill_widen_multiplier;
             if widen_mult > Decimal::ONE {
-                if post_fill_widen.get(&(pair.symbol.clone(), Side::Bid))
+                if post_fill_widen
+                    .get(&(pair.symbol.clone(), Side::Bid))
                     .map(|&exp| now_inst < exp)
                     .unwrap_or(false)
                 {
                     factor_snapshot.post_fill_widen_bid = widen_mult;
                 }
-                if post_fill_widen.get(&(pair.symbol.clone(), Side::Ask))
+                if post_fill_widen
+                    .get(&(pair.symbol.clone(), Side::Ask))
                     .map(|&exp| now_inst < exp)
                     .unwrap_or(false)
                 {
@@ -1168,6 +1195,18 @@ where
                     proportional_vol_widening(factor_snapshot.raw_volatility, utilization);
             }
 
+            let market = state.market.symbols.get(&pair.symbol);
+            let best_bid = market.and_then(|market| market.best_bid);
+            let best_ask = market.and_then(|market| market.best_ask);
+            let mid = market.and_then(|market| market.mid_price());
+            let microprice_from_bbo = market.and_then(|market| market.microprice()).is_some();
+            let microprice_offset_bps = match mid {
+                Some(raw_mid) if raw_mid > Decimal::ZERO => {
+                    (factor_snapshot.microprice - raw_mid) / raw_mid * Decimal::from(10_000u64)
+                }
+                _ => Decimal::ZERO,
+            };
+
             info!(
                 symbol = %pair.symbol,
                 regime = ?factor_snapshot.regime,
@@ -1178,6 +1217,14 @@ where
                 flow_direction = %factor_snapshot.flow_direction,
                 consecutive_flow_spike = factor_snapshot.consecutive_flow_spike,
                 ob_imbalance = %factor_snapshot.ob_imbalance,
+                microprice = %factor_snapshot.microprice,
+                microprice_from_bbo,
+                microprice_offset_bps = %microprice_offset_bps,
+                vpin = %factor_snapshot.vpin,
+                funding_lean_bps = %factor_snapshot.funding_lean,
+                kappa_estimate = ?factor_snapshot.kappa_estimate,
+                post_fill_widen_bid = %factor_snapshot.post_fill_widen_bid,
+                post_fill_widen_ask = %factor_snapshot.post_fill_widen_ask,
                 inventory_skew = %factor_snapshot.inventory_skew,
                 recent_trade_count = factor_snapshot.recent_trade_count,
                 degraded,
@@ -1192,10 +1239,6 @@ where
                 warn!(symbol = %pair.symbol, "missing instrument metadata; skipping symbol");
                 continue;
             };
-            let market = state.market.symbols.get(&pair.symbol);
-            let best_bid = market.and_then(|market| market.best_bid);
-            let best_ask = market.and_then(|market| market.best_ask);
-            let mid = market.and_then(|market| market.mid_price());
             let reference_price = mid.or(best_bid).or(best_ask).unwrap_or(Decimal::ZERO);
             let parsed_pair = self
                 .parsed
@@ -1279,7 +1322,8 @@ where
                     continue;
                 }
                 if !is_unwind {
-                    if let Some(&cooled_at) = side_cooldown.get(&(pair.symbol.clone(), quote.side)) {
+                    if let Some(&cooled_at) = side_cooldown.get(&(pair.symbol.clone(), quote.side))
+                    {
                         if cooled_at.elapsed() < Duration::from_secs(3) {
                             continue;
                         }
@@ -1476,10 +1520,7 @@ fn round_to_tick_for_side(price: Decimal, tick_size: Option<Decimal>, side: Side
     }
 }
 
-fn quantize_order_quantity_for_checks(
-    quantity: Decimal,
-    instrument: &InstrumentMeta,
-) -> Decimal {
+fn quantize_order_quantity_for_checks(quantity: Decimal, instrument: &InstrumentMeta) -> Decimal {
     if quantity <= Decimal::ZERO {
         return Decimal::ZERO;
     }
@@ -1529,7 +1570,9 @@ fn clip_symbol_orders_to_bbo(
 ) {
     for order in orders.iter_mut() {
         if let Some(price) = order.price {
-            order.price = Some(clip_to_bbo(price, order.side, best_bid, best_ask, tick_size));
+            order.price = Some(clip_to_bbo(
+                price, order.side, best_bid, best_ask, tick_size,
+            ));
         }
     }
 
@@ -1586,9 +1629,11 @@ fn should_cancel_on_adverse_bbo_move(
     current_orders: &HashMap<String, crate::domain::OpenOrder>,
     state: &BotState,
 ) -> bool {
-    current_orders
-        .values()
-        .any(|order| bbo_gap_bps(order, state).map(|gap| gap > Decimal::from(2u64)).unwrap_or(false))
+    current_orders.values().any(|order| {
+        bbo_gap_bps(order, state)
+            .map(|gap| gap > Decimal::from(2u64))
+            .unwrap_or(false)
+    })
 }
 
 fn filter_orders_against_current_bbo(
@@ -1889,10 +1934,11 @@ fn log_minute_stats(config: &AppConfig, state: &BotState, stats: &MinuteStats) {
         .sum();
 
     // Notional-weighted average spread earned across all live fills this minute.
-    let live_fills = stats.fills_count.saturating_sub(stats.simulated_fills_count);
+    let live_fills = stats
+        .fills_count
+        .saturating_sub(stats.simulated_fills_count);
     let avg_spread_earned_bps = if stats.fill_notional_sum > Decimal::ZERO {
-        (stats.spread_earned_bps_sum / stats.fill_notional_sum)
-            .round_dp(2)
+        (stats.spread_earned_bps_sum / stats.fill_notional_sum).round_dp(2)
     } else {
         Decimal::ZERO
     };
@@ -2110,7 +2156,10 @@ fn live_side_capacity_base(
     };
     if is_unwind {
         // Can close at most abs(position), bounded by max_position_base.
-        return current_position.abs().min(pair.max_position_base).max(Decimal::ZERO);
+        return current_position
+            .abs()
+            .min(pair.max_position_base)
+            .max(Decimal::ZERO);
     }
 
     // Accumulation side: apply the full USD + pair position limits.
@@ -2188,7 +2237,8 @@ fn diff_group(
                 let price_delta = (current_price - target_price).abs();
                 let volume_delta = (current_order.remaining_quantity - target_order.quantity).abs();
 
-                let price_limit = price_floor.max(target_price.abs() * price_threshold) * level_scale;
+                let price_limit =
+                    price_floor.max(target_price.abs() * price_threshold) * level_scale;
                 let volume_limit = volume_floor.max(target_order.quantity.abs() * volume_threshold);
 
                 if price_delta > price_limit || volume_delta > volume_limit {
@@ -2246,9 +2296,11 @@ fn infer_fill_analytics(state: &BotState, fill: &Fill) -> (usize, Decimal) {
                 .min_by(|left, right| {
                     let left_delta = (left.price.unwrap_or(fill.price) - fill.price).abs();
                     let right_delta = (right.price.unwrap_or(fill.price) - fill.price).abs();
-                    left_delta
-                        .cmp(&right_delta)
-                        .then_with(|| left.level_index.unwrap_or(usize::MAX).cmp(&right.level_index.unwrap_or(usize::MAX)))
+                    left_delta.cmp(&right_delta).then_with(|| {
+                        left.level_index
+                            .unwrap_or(usize::MAX)
+                            .cmp(&right.level_index.unwrap_or(usize::MAX))
+                    })
                 })
                 .and_then(|order| order.level_index)
         })
@@ -2264,8 +2316,8 @@ fn infer_fill_analytics(state: &BotState, fill: &Fill) -> (usize, Decimal) {
         let mid = market.mid_price().filter(|&m| m > Decimal::ZERO);
         if let Some(mid) = mid {
             let edge = match fill.side {
-                Side::Bid => mid - fill.price,   // how far below mid we bought
-                Side::Ask => fill.price - mid,   // how far above mid we sold
+                Side::Bid => mid - fill.price, // how far below mid we bought
+                Side::Ask => fill.price - mid, // how far above mid we sold
             };
             (edge / mid * Decimal::from(10_000u64)).max(Decimal::ZERO)
         } else {
@@ -2323,10 +2375,18 @@ fn market_reference(
             timestamp,
         } => {
             let best_bid = bids.keys().next_back().copied().or_else(|| {
-                state.market.symbols.get(symbol).and_then(|market| market.best_bid)
+                state
+                    .market
+                    .symbols
+                    .get(symbol)
+                    .and_then(|market| market.best_bid)
             });
             let best_ask = asks.keys().next().copied().or_else(|| {
-                state.market.symbols.get(symbol).and_then(|market| market.best_ask)
+                state
+                    .market
+                    .symbols
+                    .get(symbol)
+                    .and_then(|market| market.best_ask)
             });
             match (best_bid, best_ask) {
                 (Some(bid), Some(ask)) => Some((

@@ -220,7 +220,11 @@ impl GrvtClient {
     /// Like `post_trading` but uses the dedicated low-latency order governor (30ms)
     /// instead of the general private REST governor, so parallel order placements
     /// don't serialize behind the general 200ms rate limit.
-    async fn post_trading_order<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<Value> {
+    async fn post_trading_order<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<Value> {
         let (cookie, account_id) = self.ensure_session().await?;
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, HeaderValue::from_str(&cookie)?);
@@ -299,47 +303,51 @@ impl GrvtClient {
         // Any position with < $5 notional is a dust residual the exchange would reject.
         // Skip it to avoid crashing cleanup on tiny positions.
         let min_close_notional = Decimal::new(5, 0);
-
-        let requests = positions
+        let instruments = self.instruments_by_symbol().await?;
+        let mut orders = Vec::new();
+        for position in positions
             .iter()
             .filter(|position| position.quantity != Decimal::ZERO)
-            .map(|position| async {
-                let (bid, ask) = self.fetch_best_bid_ask_snapshot(&position.symbol).await?;
-                // Place on the passive (maker) side: long → sell at ask, short → buy at bid.
-                // This sits in the book and waits for a fill rather than crossing as a taker.
-                let (side, price) = if position.quantity.is_sign_positive() {
-                    (Side::Ask, ask)
-                } else {
-                    (Side::Bid, bid)
-                };
-                let notional = position.quantity.abs() * price;
-                if notional < min_close_notional {
-                    warn!(
-                        symbol = %position.symbol,
-                        quantity = %position.quantity,
-                        price = %price,
-                        notional = %notional,
-                        "skipping dust residual position in cleanup (below $1 notional)"
-                    );
-                    return Ok::<Option<OrderRequest>, anyhow::Error>(None);
-                }
-                Ok(Some(OrderRequest {
-                    symbol: position.symbol.clone(),
-                    contract_id: 0,
-                    level_index: 0,
-                    side,
-                    order_type: OrderType::Limit,
-                    price: Some(price),
-                    quantity: position.quantity.abs(),
-                    post_only: true,
-                }))
-            });
-
-        let mut orders = Vec::new();
-        for request in requests {
-            if let Some(order) = request.await? {
-                orders.push(order);
+        {
+            let (bid, ask) = self.fetch_best_bid_ask_snapshot(&position.symbol).await?;
+            let instrument = instruments
+                .get(&position.symbol)
+                .with_context(|| format!("missing grvt instrument for {}", position.symbol))?;
+            // Place on the passive (maker) side, but improve by one tick toward mid when
+            // the spread allows it. Joining the stale best quote can leave small startup
+            // residuals sitting at the back of queue for minutes.
+            let (side, price) = if position.quantity.is_sign_positive() {
+                (
+                    Side::Ask,
+                    cleanup_limit_price(Side::Ask, bid, ask, instrument.meta.tick_size),
+                )
+            } else {
+                (
+                    Side::Bid,
+                    cleanup_limit_price(Side::Bid, bid, ask, instrument.meta.tick_size),
+                )
+            };
+            let notional = position.quantity.abs() * price;
+            if notional < min_close_notional {
+                warn!(
+                    symbol = %position.symbol,
+                    quantity = %position.quantity,
+                    price = %price,
+                    notional = %notional,
+                    "skipping dust residual position in cleanup (below $5 notional)"
+                );
+                continue;
             }
+            orders.push(OrderRequest {
+                symbol: position.symbol.clone(),
+                contract_id: 0,
+                level_index: 0,
+                side,
+                order_type: OrderType::Limit,
+                price: Some(price),
+                quantity: position.quantity.abs(),
+                post_only: true,
+            });
         }
         if orders.is_empty() {
             return Ok(());
@@ -355,7 +363,11 @@ impl GrvtClient {
             // Use a rough mark price estimate for the dust-notional check.
             // For market orders the price field is unused by the exchange.
             let (bid, ask) = self.fetch_best_bid_ask_snapshot(&position.symbol).await?;
-            let ref_price = if position.quantity.is_sign_positive() { ask } else { bid };
+            let ref_price = if position.quantity.is_sign_positive() {
+                ask
+            } else {
+                bid
+            };
             let notional = position.quantity.abs() * ref_price;
             if notional < min_close_notional {
                 warn!(
@@ -366,7 +378,11 @@ impl GrvtClient {
                 );
                 continue;
             }
-            let side = if position.quantity.is_sign_positive() { Side::Ask } else { Side::Bid };
+            let side = if position.quantity.is_sign_positive() {
+                Side::Ask
+            } else {
+                Side::Bid
+            };
             orders.push(OrderRequest {
                 symbol: position.symbol.clone(),
                 contract_id: 0,
@@ -743,8 +759,14 @@ impl ExchangeClient for GrvtClient {
                                 symbol: symbol.clone(),
                                 bid,
                                 ask,
-                                bid_size: result.get("best_bid_size").or_else(|| result.get("bq")).and_then(as_decimal),
-                                ask_size: result.get("best_ask_size").or_else(|| result.get("aq")).and_then(as_decimal),
+                                bid_size: result
+                                    .get("best_bid_size")
+                                    .or_else(|| result.get("bq"))
+                                    .and_then(as_decimal),
+                                ask_size: result
+                                    .get("best_ask_size")
+                                    .or_else(|| result.get("aq"))
+                                    .and_then(as_decimal),
                                 timestamp: now,
                             });
                         }
@@ -1022,7 +1044,9 @@ impl GrvtClient {
             .or_else(|| result.get("totalEquity"))
             .or_else(|| result.get("net_equity"))
             .and_then(as_decimal)
-            .ok_or_else(|| anyhow::anyhow!("grvt account_summary missing total_equity field: {result}"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("grvt account_summary missing total_equity field: {result}")
+            })
     }
 
     async fn subscribe_private_streams(
@@ -1032,7 +1056,11 @@ impl GrvtClient {
         >,
     ) -> Result<()> {
         let selectors = vec![self.config.grvt_sub_account_id.clone()];
-        for (id, stream) in [(201u64, "v1.fill"), (202u64, "v1.position"), (203u64, "v1.order")] {
+        for (id, stream) in [
+            (201u64, "v1.fill"),
+            (202u64, "v1.position"),
+            (203u64, "v1.order"),
+        ] {
             let subscribe = serde_json::to_string(&json!({
                 "jsonrpc": "2.0",
                 "method": "subscribe",
@@ -1060,8 +1088,12 @@ impl OrderExecutor for GrvtClient {
                 let instrument = instruments
                     .get(&request.symbol)
                     .with_context(|| format!("missing grvt instrument for {}", request.symbol))?;
-                let payload = client.build_grvt_order_payload(&request, instrument).await?;
-                let response = client.post_trading_order("/full/v1/create_order", &payload).await?;
+                let payload = client
+                    .build_grvt_order_payload(&request, instrument)
+                    .await?;
+                let response = client
+                    .post_trading_order("/full/v1/create_order", &payload)
+                    .await?;
                 if response.get("error").is_some() {
                     bail!("grvt create_order rejected: {response}");
                 }
@@ -1279,8 +1311,14 @@ fn parse_market_events(stream_name: &str, frame: &str) -> Result<Vec<MarketEvent
                     symbol: internal_symbol.clone(),
                     bid,
                     ask,
-                    bid_size: feed.get("best_bid_size").or_else(|| feed.get("bq")).and_then(as_decimal),
-                    ask_size: feed.get("best_ask_size").or_else(|| feed.get("aq")).and_then(as_decimal),
+                    bid_size: feed
+                        .get("best_bid_size")
+                        .or_else(|| feed.get("bq"))
+                        .and_then(as_decimal),
+                    ask_size: feed
+                        .get("best_ask_size")
+                        .or_else(|| feed.get("aq"))
+                        .and_then(as_decimal),
                     timestamp,
                 });
             }
@@ -1491,7 +1529,8 @@ fn parse_grvt_position(value: &Value) -> Option<Position> {
             .or_else(|| value.get("ep"))
             .and_then(as_decimal)
             .or_else(|| {
-                value.get("avg_entry_price")
+                value
+                    .get("avg_entry_price")
                     .or_else(|| value.get("aep"))
                     .and_then(as_decimal)
             })
@@ -1569,16 +1608,28 @@ fn parse_grvt_private_events(frame: &str) -> Result<Vec<PrivateEvent>> {
     let events = match stream {
         "v1.fill" => {
             if let Some(arr) = feed.as_array() {
-                arr.iter().filter_map(parse_grvt_fill).map(PrivateEvent::Fill).collect()
+                arr.iter()
+                    .filter_map(parse_grvt_fill)
+                    .map(PrivateEvent::Fill)
+                    .collect()
             } else {
-                parse_grvt_fill(feed).map(PrivateEvent::Fill).into_iter().collect()
+                parse_grvt_fill(feed)
+                    .map(PrivateEvent::Fill)
+                    .into_iter()
+                    .collect()
             }
         }
         "v1.position" => {
             if let Some(arr) = feed.as_array() {
-                arr.iter().filter_map(parse_grvt_position).map(PrivateEvent::Position).collect()
+                arr.iter()
+                    .filter_map(parse_grvt_position)
+                    .map(PrivateEvent::Position)
+                    .collect()
             } else {
-                parse_grvt_position(feed).map(PrivateEvent::Position).into_iter().collect()
+                parse_grvt_position(feed)
+                    .map(PrivateEvent::Position)
+                    .into_iter()
+                    .collect()
             }
         }
         "v1.order" => {
@@ -1742,6 +1793,39 @@ fn grvt_quantize_price(price: Decimal, tick_size: Option<Decimal>) -> Decimal {
     match tick_size {
         Some(step) if step > Decimal::ZERO => align_to_step(price, step),
         _ => price,
+    }
+}
+
+fn cleanup_limit_price(
+    side: Side,
+    best_bid: Decimal,
+    best_ask: Decimal,
+    tick_size: Option<Decimal>,
+) -> Decimal {
+    let Some(step) = tick_size.filter(|step| *step > Decimal::ZERO) else {
+        return match side {
+            Side::Bid => best_bid,
+            Side::Ask => best_ask,
+        };
+    };
+
+    match side {
+        Side::Bid => {
+            let improved = best_bid + step;
+            if improved < best_ask {
+                improved
+            } else {
+                best_bid
+            }
+        }
+        Side::Ask => {
+            let improved = best_ask - step;
+            if improved > best_bid {
+                improved
+            } else {
+                best_ask
+            }
+        }
     }
 }
 

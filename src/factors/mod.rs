@@ -41,10 +41,11 @@ impl VpinTracker {
         }
         self.current_buy += buy_vol;
         self.current_sell += sell_vol;
-        let total = self.current_buy + self.current_sell;
-        while total >= self.bucket_size {
+        loop {
             let bucket_total = self.current_buy + self.current_sell;
-            if bucket_total.is_zero() { break; }
+            if bucket_total < self.bucket_size || bucket_total.is_zero() {
+                break;
+            }
             let imbalance = ((self.current_buy - self.current_sell) / bucket_total).abs();
             self.buckets.push_back(imbalance);
             while self.buckets.len() > self.n_buckets {
@@ -55,14 +56,19 @@ impl VpinTracker {
             self.current_buy -= self.current_buy * frac;
             self.current_sell -= self.current_sell * frac;
             // clamp to zero to avoid floating-point drift
-            if self.current_buy < Decimal::ZERO { self.current_buy = Decimal::ZERO; }
-            if self.current_sell < Decimal::ZERO { self.current_sell = Decimal::ZERO; }
-            break; // process at most one bucket per trade to avoid infinite loops
+            if self.current_buy < Decimal::ZERO {
+                self.current_buy = Decimal::ZERO;
+            }
+            if self.current_sell < Decimal::ZERO {
+                self.current_sell = Decimal::ZERO;
+            }
         }
     }
 
     fn vpin(&self) -> Decimal {
-        if self.buckets.is_empty() { return Decimal::ZERO; }
+        if self.buckets.is_empty() {
+            return Decimal::ZERO;
+        }
         let sum: Decimal = self.buckets.iter().sum();
         sum / Decimal::from(self.buckets.len() as u64)
     }
@@ -88,6 +94,8 @@ struct SymbolFactorState {
     regime_entered_at: Option<DateTime<Utc>>,
     trade_velocity_ewma: Decimal,
     bbo_spread_ewma: Option<Decimal>,
+    last_vpin_trade_time: Option<DateTime<Utc>>,
+    last_vpin_trade_count_at_time: usize,
     /// Consecutive factor cycles where |raw_flow_direction| > 0.7.
     /// Used as a fallback to force TrendingToxic even when EWMA lags.
     consecutive_high_raw_flow: u32,
@@ -110,6 +118,8 @@ impl Default for SymbolFactorState {
             regime_entered_at: Some(Utc::now()),
             trade_velocity_ewma: Decimal::ZERO,
             bbo_spread_ewma: None,
+            last_vpin_trade_time: None,
+            last_vpin_trade_count_at_time: 0,
             consecutive_high_raw_flow: 0,
             consecutive_flow_spike: 0,
         }
@@ -187,13 +197,53 @@ impl FactorEngine {
             .filter(|trade| trade.timestamp >= n_trade_window_start)
             .count();
 
-        // VPIN: feed this window's buy/sell volume into the per-symbol bucket tracker.
+        // VPIN: only feed newly-seen trades into the bucket tracker so we don't
+        // double-count the entire rolling window on every compute cycle.
+        let mut new_buy_volume = Decimal::ZERO;
+        let mut new_sell_volume = Decimal::ZERO;
+        let mut new_last_trade_time = symbol_state.last_vpin_trade_time;
+        let mut new_last_trade_count_at_time = symbol_state.last_vpin_trade_count_at_time;
+        let mut seen_at_last_time = 0usize;
+        for trade in &market.recent_trades {
+            let already_processed = match symbol_state.last_vpin_trade_time {
+                Some(last_time) if trade.timestamp < last_time => true,
+                Some(last_time) if trade.timestamp == last_time => {
+                    seen_at_last_time += 1;
+                    seen_at_last_time <= symbol_state.last_vpin_trade_count_at_time
+                }
+                _ => false,
+            };
+            if already_processed {
+                continue;
+            }
+
+            match trade.taker_side {
+                Some(crate::domain::Side::Bid) => new_buy_volume += trade.quantity,
+                Some(crate::domain::Side::Ask) => new_sell_volume += trade.quantity,
+                None => {}
+            }
+
+            if Some(trade.timestamp) == new_last_trade_time {
+                new_last_trade_count_at_time += 1;
+            } else {
+                new_last_trade_time = Some(trade.timestamp);
+                new_last_trade_count_at_time = 1;
+            }
+        }
+
         if parsed.factors.vpin_bucket_size > Decimal::ZERO {
             let vpin_tracker = self
                 .vpin_trackers
                 .entry(pair.symbol.clone())
-                .or_insert_with(|| VpinTracker::new(parsed.factors.vpin_bucket_size, parsed.factors.vpin_n_buckets));
-            vpin_tracker.add_trade(buy_volume, sell_volume);
+                .or_insert_with(|| {
+                    VpinTracker::new(
+                        parsed.factors.vpin_bucket_size,
+                        parsed.factors.vpin_n_buckets,
+                    )
+                });
+            vpin_tracker.add_trade(new_buy_volume, new_sell_volume);
+            symbol_state.last_vpin_trade_time = new_last_trade_time;
+            symbol_state.last_vpin_trade_count_at_time = new_last_trade_count_at_time;
         }
         let vpin = self
             .vpin_trackers
@@ -220,8 +270,8 @@ impl FactorEngine {
             .flow_imbalance_weight
             .max(Decimal::new(1, 2))
             .min(Decimal::ONE);
-        symbol_state.smoothed_flow =
-            flow_alpha * raw_flow_direction + (Decimal::ONE - flow_alpha) * symbol_state.smoothed_flow;
+        symbol_state.smoothed_flow = flow_alpha * raw_flow_direction
+            + (Decimal::ONE - flow_alpha) * symbol_state.smoothed_flow;
 
         if let Some(spread_bps) = market.bbo_spread_bps() {
             symbol_state.bbo_spread_ewma = Some(match symbol_state.bbo_spread_ewma {
@@ -293,7 +343,13 @@ impl FactorEngine {
         let target_regime = if force_toxic {
             MarketRegime::TrendingToxic
         } else {
-            candidate_regime(flow_abs, volatility, trade_velocity_ratio, trade_velocity, recent_trade_count)
+            candidate_regime(
+                flow_abs,
+                volatility,
+                trade_velocity_ratio,
+                trade_velocity,
+                recent_trade_count,
+            )
         };
         let min_dwell = Duration::seconds(parsed.factors.regime_min_dwell_secs as i64);
         let can_change = symbol_state
@@ -320,7 +376,10 @@ impl FactorEngine {
             regime_alpha * raw_intensity
                 + (Decimal::ONE - regime_alpha) * symbol_state.regime_intensity
         };
-        let regime_intensity = symbol_state.regime_intensity.min(Decimal::ONE).max(Decimal::ZERO);
+        let regime_intensity = symbol_state
+            .regime_intensity
+            .min(Decimal::ONE)
+            .max(Decimal::ZERO);
 
         let time_multiplier = time_of_day_multiplier(now);
         // Microprice (effective BBO size-weighted mid, already blended with raw_mid).
@@ -405,9 +464,7 @@ impl FactorEngine {
         let consecutive_flow_spike = symbol_state.consecutive_flow_spike;
 
         // Fill-rate asymmetry: bid/ask fill rate over rolling window.
-        let window_secs = parsed.model.fill_rate_window_secs
-            .to_i64()
-            .unwrap_or(300);
+        let window_secs = parsed.model.fill_rate_window_secs.to_i64().unwrap_or(300);
         let fill_rate_skew = fill_tracker.fill_rate_skew(
             &pair.symbol,
             window_secs,
@@ -451,7 +508,7 @@ impl FactorEngine {
             vpin,
             funding_lean,
             kappa_estimate,
-            post_fill_widen_bid: Decimal::ONE,  // populated by engine after compute()
+            post_fill_widen_bid: Decimal::ONE, // populated by engine after compute()
             post_fill_widen_ask: Decimal::ONE,
         })
     }
@@ -461,7 +518,10 @@ fn maybe_shrink_vecdeque<T>(deque: &mut VecDeque<T>, label: &str) {
     let len = deque.len();
     let capacity = deque.capacity();
     if capacity > len.saturating_mul(2).max(1024) {
-        debug!(label, len, capacity, "shrinking factor VecDeque after burst");
+        debug!(
+            label,
+            len, capacity, "shrinking factor VecDeque after burst"
+        );
         deque.shrink_to_fit();
     }
 }

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
 use anyhow::{bail, Result};
+use async_trait::async_trait;
 use rust_decimal::Decimal;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -110,7 +110,9 @@ async fn close_positions_with_limit_orders(
         .await;
 
     exchange.cancel_all_orders().await?;
-    exchange.submit_market_close_orders(&residual_positions).await?;
+    exchange
+        .submit_market_close_orders(&residual_positions)
+        .await?;
 
     // Give the market orders a moment to fill, then verify.
     sleep(Duration::from_secs(2)).await;

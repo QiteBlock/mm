@@ -254,7 +254,11 @@ impl RequestPolicy {
 
             on_reconnect().await?;
             let total_delay = current_backoff + TokioDuration::from_millis(jitter_ms) + extra_delay;
-            warn!(stream = stream_name, ?total_delay, "websocket reconnect back-off");
+            warn!(
+                stream = stream_name,
+                ?total_delay,
+                "websocket reconnect back-off"
+            );
             sleep(total_delay).await;
         }
     }

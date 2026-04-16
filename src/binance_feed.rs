@@ -6,9 +6,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
-    connect_async_tls_with_config,
-    tungstenite::Message as WsMessage,
-    Connector,
+    connect_async_tls_with_config, tungstenite::Message as WsMessage, Connector,
 };
 use tracing::{info, warn};
 
@@ -72,14 +70,7 @@ pub async fn stream_binance_spot_prices(
         info!(%ws_url, "connecting to Binance futures markPrice@1s stream (native-tls)");
 
         let connector = Connector::NativeTls(tls_connector.clone());
-        match connect_async_tls_with_config(
-            ws_url.as_str(),
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        {
+        match connect_async_tls_with_config(ws_url.as_str(), None, false, Some(connector)).await {
             Ok((ws_stream, _)) => {
                 let (mut write, mut read) = ws_stream.split();
                 loop {
@@ -105,12 +96,24 @@ pub async fn stream_binance_spot_prices(
                     let mut needs_reconnect = false;
                     let mut pong_payload: Option<Vec<u8>> = None;
 
-                    process_frame(first, &reverse_map, &mut latest, &mut needs_reconnect, &mut pong_payload);
+                    process_frame(
+                        first,
+                        &reverse_map,
+                        &mut latest,
+                        &mut needs_reconnect,
+                        &mut pong_payload,
+                    );
 
                     loop {
                         match tokio::time::timeout(Duration::ZERO, read.next()).await {
                             Ok(Some(Ok(frame))) => {
-                                process_frame(frame, &reverse_map, &mut latest, &mut needs_reconnect, &mut pong_payload);
+                                process_frame(
+                                    frame,
+                                    &reverse_map,
+                                    &mut latest,
+                                    &mut needs_reconnect,
+                                    &mut pong_payload,
+                                );
                             }
                             _ => break,
                         }
@@ -192,7 +195,9 @@ async fn poll_binance_rest(symbol_map: HashMap<String, String>, sender: mpsc::Se
                             }
                         }
                     }
-                    Err(e) => warn!(err = %e, symbol = %binance_symbol, "Binance REST parse failed"),
+                    Err(e) => {
+                        warn!(err = %e, symbol = %binance_symbol, "Binance REST parse failed")
+                    }
                 },
                 Err(e) => warn!(err = %e, symbol = %binance_symbol, "Binance REST request failed"),
             }
@@ -224,7 +229,10 @@ fn process_frame(
     }
 }
 
-fn parse_mark_price(text: &str, reverse_map: &HashMap<String, String>) -> Option<(String, Decimal)> {
+fn parse_mark_price(
+    text: &str,
+    reverse_map: &HashMap<String, String>,
+) -> Option<(String, Decimal)> {
     let envelope: BinanceEnvelope = serde_json::from_str(text).ok()?;
     let prefix = envelope.stream.split('@').next()?;
     let grvt_symbol = reverse_map.get(prefix)?.clone();

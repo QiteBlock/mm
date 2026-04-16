@@ -128,10 +128,7 @@ impl TelegramInner {
             chat_id: self.chat_id.clone(),
             text,
         };
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
         match self.client.post(url).json(&request).send().await {
             Ok(response) => {
                 let status = response.status();

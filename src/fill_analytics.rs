@@ -49,7 +49,9 @@ impl PostFillObservation {
         let Some(p5) = self.price_5s else { return };
         let Some(p1) = self.price_1s else { return };
         let base = self.fill_price;
-        if base <= Decimal::ZERO { return; }
+        if base <= Decimal::ZERO {
+            return;
+        }
         let bps = |p: Decimal| {
             let raw = match self.side {
                 Side::Bid => (base - p) / base,
@@ -86,10 +88,20 @@ impl FillRateState {
     }
 
     fn purge_old(&mut self, cutoff: DateTime<Utc>) {
-        while self.bid_timestamps.front().map(|&t| t < cutoff).unwrap_or(false) {
+        while self
+            .bid_timestamps
+            .front()
+            .map(|&t| t < cutoff)
+            .unwrap_or(false)
+        {
             self.bid_timestamps.pop_front();
         }
-        while self.ask_timestamps.front().map(|&t| t < cutoff).unwrap_or(false) {
+        while self
+            .ask_timestamps
+            .front()
+            .map(|&t| t < cutoff)
+            .unwrap_or(false)
+        {
             self.ask_timestamps.pop_front();
         }
     }
@@ -135,7 +147,11 @@ struct KappaState {
 impl KappaState {
     fn record_cycle(&mut self, was_filled: bool) {
         let alpha = Decimal::new(5, 2); // 0.05
-        let sample = if was_filled { Decimal::ONE } else { Decimal::ZERO };
+        let sample = if was_filled {
+            Decimal::ONE
+        } else {
+            Decimal::ZERO
+        };
         self.fill_prob_ewma = Some(match self.fill_prob_ewma {
             None => sample,
             Some(prev) => alpha * sample + (Decimal::ONE - alpha) * prev,
@@ -146,10 +162,14 @@ impl KappaState {
     /// Returns estimated κ given the level-0 half-spread fraction.
     fn kappa_estimate(&self, min_cycles: u64, half_spread_frac: Decimal) -> Option<Decimal> {
         use rust_decimal::MathematicalOps;
-        if self.cycles < min_cycles { return None; }
+        if self.cycles < min_cycles {
+            return None;
+        }
         let prob = self.fill_prob_ewma?;
         let prob_clamped = prob.clamp(Decimal::new(1, 4), Decimal::new(9999, 4)); // [0.0001, 0.9999]
-        if half_spread_frac <= Decimal::ZERO { return None; }
+        if half_spread_frac <= Decimal::ZERO {
+            return None;
+        }
         let neg_ln = -(prob_clamped.ln());
         Some((neg_ln / half_spread_frac).max(Decimal::new(1, 1))) // kappa >= 0.1
     }
@@ -157,7 +177,10 @@ impl KappaState {
 
 impl Default for KappaState {
     fn default() -> Self {
-        Self { fill_prob_ewma: None, cycles: 0 }
+        Self {
+            fill_prob_ewma: None,
+            cycles: 0,
+        }
     }
 }
 
@@ -198,24 +221,33 @@ impl FillTracker {
             self.pending_l0_fills.insert(symbol.clone());
         }
         // Record for post-fill price tracking.
-        self.post_fill.entry(symbol.clone()).or_default().push(PostFillObservation {
-            symbol: symbol.clone(),
-            side,
-            fill_price,
-            timestamp,
-            price_1s: None,
-            price_5s: None,
-            price_30s: None,
-        });
+        self.post_fill
+            .entry(symbol.clone())
+            .or_default()
+            .push(PostFillObservation {
+                symbol: symbol.clone(),
+                side,
+                fill_price,
+                timestamp,
+                price_1s: None,
+                price_5s: None,
+                price_30s: None,
+            });
         // Record for fill-rate asymmetry.
-        self.fill_rate.entry(symbol).or_default().record(side, timestamp);
+        self.fill_rate
+            .entry(symbol)
+            .or_default()
+            .record(side, timestamp);
     }
 
     /// Call every reconcile cycle for each quoted symbol.
     /// Consumes any pending level-0 fill recorded by `record_fill`.
     pub fn record_quote_cycle(&mut self, symbol: &str) {
         let was_filled = self.pending_l0_fills.remove(symbol);
-        self.kappa.entry(symbol.to_string()).or_default().record_cycle(was_filled);
+        self.kappa
+            .entry(symbol.to_string())
+            .or_default()
+            .record_cycle(was_filled);
     }
 
     pub fn observe_price(
@@ -307,8 +339,15 @@ impl FillTracker {
 
     /// Online kappa estimate from empirical fill probability at level 0.
     /// Returns None until `min_cycles` have been observed.
-    pub fn kappa_estimate(&self, symbol: &str, min_cycles: u64, half_spread_frac: Decimal) -> Option<Decimal> {
-        self.kappa.get(symbol)?.kappa_estimate(min_cycles, half_spread_frac)
+    pub fn kappa_estimate(
+        &self,
+        symbol: &str,
+        min_cycles: u64,
+        half_spread_frac: Decimal,
+    ) -> Option<Decimal> {
+        self.kappa
+            .get(symbol)?
+            .kappa_estimate(min_cycles, half_spread_frac)
     }
 }
 

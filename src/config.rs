@@ -143,20 +143,53 @@ impl AppConfig {
                 max_spread_bps: parse_decimal("model.max_spread_bps", &self.model.max_spread_bps)?,
                 as_gamma: parse_decimal("model.as_gamma", &self.model.as_gamma)?,
                 as_kappa: parse_decimal("model.as_kappa", &self.model.as_kappa)?,
-                as_time_horizon: parse_decimal("model.as_time_horizon", &self.model.as_time_horizon)?,
-                inventory_lean_bps: parse_decimal("model.inventory_lean_bps", &self.model.inventory_lean_bps)?,
+                as_time_horizon: parse_decimal(
+                    "model.as_time_horizon",
+                    &self.model.as_time_horizon,
+                )?,
+                inventory_lean_bps: parse_decimal(
+                    "model.inventory_lean_bps",
+                    &self.model.inventory_lean_bps,
+                )?,
                 as_vol_cap: parse_decimal("model.as_vol_cap", &self.model.as_vol_cap)?,
-                fill_rate_window_secs: parse_decimal("model.fill_rate_window_secs", &self.model.fill_rate_window_secs)?,
-                fill_rate_skew_threshold: parse_decimal("model.fill_rate_skew_threshold", &self.model.fill_rate_skew_threshold)?,
-                fill_rate_competitive_bps: parse_decimal("model.fill_rate_competitive_bps", &self.model.fill_rate_competitive_bps)?,
-                vpin_widen_multiplier: parse_decimal("model.vpin_widen_multiplier", &self.model.vpin_widen_multiplier)?,
-                funding_lean_weight: parse_decimal("model.funding_lean_weight", &self.model.funding_lean_weight)?,
-                post_fill_widen_secs: self.model.post_fill_widen_secs.parse::<u64>()
+                fill_rate_window_secs: parse_decimal(
+                    "model.fill_rate_window_secs",
+                    &self.model.fill_rate_window_secs,
+                )?,
+                fill_rate_skew_threshold: parse_decimal(
+                    "model.fill_rate_skew_threshold",
+                    &self.model.fill_rate_skew_threshold,
+                )?,
+                fill_rate_competitive_bps: parse_decimal(
+                    "model.fill_rate_competitive_bps",
+                    &self.model.fill_rate_competitive_bps,
+                )?,
+                vpin_widen_multiplier: parse_decimal(
+                    "model.vpin_widen_multiplier",
+                    &self.model.vpin_widen_multiplier,
+                )?,
+                funding_lean_weight: parse_decimal(
+                    "model.funding_lean_weight",
+                    &self.model.funding_lean_weight,
+                )?,
+                post_fill_widen_secs: self
+                    .model
+                    .post_fill_widen_secs
+                    .parse::<u64>()
                     .with_context(|| "invalid u64 for model.post_fill_widen_secs")?,
-                post_fill_widen_multiplier: parse_decimal("model.post_fill_widen_multiplier", &self.model.post_fill_widen_multiplier)?,
-                online_kappa: self.model.online_kappa.parse::<bool>()
+                post_fill_widen_multiplier: parse_decimal(
+                    "model.post_fill_widen_multiplier",
+                    &self.model.post_fill_widen_multiplier,
+                )?,
+                online_kappa: self
+                    .model
+                    .online_kappa
+                    .parse::<bool>()
                     .with_context(|| "invalid bool for model.online_kappa")?,
-                kappa_min_cycles: self.model.kappa_min_cycles.parse::<u64>()
+                kappa_min_cycles: self
+                    .model
+                    .kappa_min_cycles
+                    .parse::<u64>()
                     .with_context(|| "invalid u64 for model.kappa_min_cycles")?,
             },
             risk: ParsedRiskConfig {
@@ -265,7 +298,8 @@ impl AppConfig {
                 microprice_weight: parse_decimal(
                     "factors.microprice_weight",
                     &self.factors.microprice_weight,
-                )?.clamp(Decimal::ZERO, Decimal::ONE),
+                )?
+                .clamp(Decimal::ZERO, Decimal::ONE),
                 cex_reference_lean_weight: parse_decimal(
                     "factors.cex_reference_lean_weight",
                     &self.factors.cex_reference_lean_weight,

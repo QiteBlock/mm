@@ -45,7 +45,8 @@ pub fn generate_quotes(
     // A-S parameters
     let gamma = parsed.model.as_gamma.max(Decimal::new(1, 6));
     // Use online kappa estimate when available and enabled; fall back to config.
-    let kappa = factors.kappa_estimate
+    let kappa = factors
+        .kappa_estimate
         .unwrap_or(parsed.model.as_kappa)
         .max(Decimal::new(1, 6));
     // Time horizon in hours.
@@ -92,9 +93,7 @@ pub fn generate_quotes(
     // Funding lean: positive funding_lean shifts reservation down (lean short = offer more).
     let funding_lean_frac = factors.funding_lean / Decimal::from(10_000u64);
     let as_reservation_price = mid
-        * (Decimal::ONE
-            - pos_ratio * gamma_sigma2_t
-            - pos_ratio * inventory_lean_frac
+        * (Decimal::ONE - pos_ratio * gamma_sigma2_t - pos_ratio * inventory_lean_frac
             + ob_lean_frac
             - funding_lean_frac);
 
@@ -145,12 +144,15 @@ pub fn generate_quotes(
     // VPIN spread widening: linearly interpolate between 1× and vpin_widen_multiplier.
     let vpin_threshold = parsed.factors.vpin_widen_threshold;
     let vpin_widen_mult = if vpin_threshold > Decimal::ZERO && factors.vpin > vpin_threshold {
-        let excess = (factors.vpin - vpin_threshold) / (Decimal::ONE - vpin_threshold).max(Decimal::new(1, 6));
+        let excess = (factors.vpin - vpin_threshold)
+            / (Decimal::ONE - vpin_threshold).max(Decimal::new(1, 6));
         let mult = parsed.model.vpin_widen_multiplier;
         Decimal::ONE + (mult - Decimal::ONE) * excess.min(Decimal::ONE)
     } else {
         Decimal::ONE
     };
+    let bid_widen = factors.post_fill_widen_bid;
+    let ask_widen = factors.post_fill_widen_ask;
 
     // Fill-rate skew: when bid fills 3× faster than ask, add extra competitiveness to ask
     // (tighten it). Skew > 0 = bid faster → make ask more competitive (lower price).
@@ -162,8 +164,7 @@ pub fn generate_quotes(
     let flow_dir = factors.flow_direction;
     let toxic_reduction =
         (Decimal::ONE - Decimal::new(6, 1) * flow_dir.abs()).max(Decimal::new(4, 1));
-    let safe_boost =
-        (Decimal::ONE + Decimal::new(3, 1) * flow_dir.abs()).min(Decimal::new(15, 1));
+    let safe_boost = (Decimal::ONE + Decimal::new(3, 1) * flow_dir.abs()).min(Decimal::new(15, 1));
 
     // Level spacing always uses born_inf/sup_bps so the grid is independent of A-S.
     // A-S only sets the anchor price at level 0; deeper levels step from that anchor.
@@ -183,13 +184,27 @@ pub fn generate_quotes(
 
     // S1: Level 0 anchors to BBO, but no worse than A-S theoretical price.
     // If live BBO exists, use it clamped to A-S. If no BBO, fall back to A-S.
+    let level0_unclamped_bps =
+        parsed.model.born_inf_bps * regime_spread_multiplier * vpin_widen_mult;
+    let level0_spread_bps = level0_unclamped_bps
+        .max(fee_floor_bps)
+        .min(parsed.model.max_spread_bps);
+    let level0_half_spread_frac = level0_spread_bps / Decimal::from(20_000u64);
+    let level0_bid_candidate = as_reservation_price
+        * (Decimal::ONE
+            - level0_half_spread_frac * Decimal::TWO * bid_skew * ob_bid_spread_mult * bid_widen);
+    let level0_ask_candidate = as_reservation_price
+        * (Decimal::ONE
+            + level0_half_spread_frac * Decimal::TWO * ask_skew * ob_ask_spread_mult * ask_widen);
+    let anchor_bid_base = as_bid.min(level0_bid_candidate);
+    let anchor_ask_base = as_ask.max(level0_ask_candidate);
     let anchor_bid = match best_bid {
-        Some(bb) => bb.min(as_bid),   // join or improve A-S — never worse than A-S
-        None => as_bid,
+        Some(bb) => bb.min(anchor_bid_base),
+        None => anchor_bid_base,
     };
     let anchor_ask = match best_ask {
-        Some(ba) => ba.max(as_ask),   // join or improve A-S — never worse than A-S
-        None => as_ask,
+        Some(ba) => ba.max(anchor_ask_base),
+        None => anchor_ask_base,
     };
 
     info!(
@@ -206,8 +221,13 @@ pub fn generate_quotes(
         ob_imbalance = %factors.ob_imbalance,
         ob_lean_bps = %(ob_lean_frac * Decimal::from(10_000u64)),
         funding_lean_bps = %factors.funding_lean,
+        kappa = %kappa,
+        kappa_estimate = ?factors.kappa_estimate,
         fill_rate_skew = %factors.fill_rate_skew,
         vpin = %factors.vpin,
+        vpin_widen_mult = %vpin_widen_mult,
+        post_fill_widen_bid = %bid_widen,
+        post_fill_widen_ask = %ask_widen,
         as_bid = %as_bid,
         as_ask = %as_ask,
         anchor_bid = %anchor_bid,
@@ -237,10 +257,6 @@ pub fn generate_quotes(
             .min(parsed.model.max_spread_bps);
         let level_half_spread_frac = level_spread_bps / Decimal::from(20_000u64); // half-spread
 
-        // Post-fill conditional widening: multiply the affected side's spread.
-        let bid_widen = factors.post_fill_widen_bid;
-        let ask_widen = factors.post_fill_widen_ask;
-
         // Fill-rate competitive skew: when bid fills faster (skew > 0) → lower ask price.
         // Adjustment only at level 0 (anchor); deeper levels inherit via spread.
         let fr_ask_adj = if level == 0 {
@@ -260,8 +276,10 @@ pub fn generate_quotes(
             // Fill-rate: move toward mid on slow-filling side.
             (anchor_bid + fr_bid_adj, anchor_ask - fr_ask_adj)
         } else {
-            let bid_spread = level_half_spread_frac * Decimal::TWO * bid_skew * ob_bid_spread_mult * bid_widen;
-            let ask_spread = level_half_spread_frac * Decimal::TWO * ask_skew * ob_ask_spread_mult * ask_widen;
+            let bid_spread =
+                level_half_spread_frac * Decimal::TWO * bid_skew * ob_bid_spread_mult * bid_widen;
+            let ask_spread =
+                level_half_spread_frac * Decimal::TWO * ask_skew * ob_ask_spread_mult * ask_widen;
             (
                 anchor_bid * (Decimal::ONE - bid_spread),
                 anchor_ask * (Decimal::ONE + ask_spread),
@@ -275,8 +293,10 @@ pub fn generate_quotes(
         let ask_fill_multiplier =
             fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, level);
 
-        let mut bid_size = (base_size * bid_fill_multiplier * bid_size_skew * ob_bid_size_mult).max(Decimal::ZERO);
-        let mut ask_size = (base_size * ask_fill_multiplier * ask_size_skew * ob_ask_size_mult).max(Decimal::ZERO);
+        let mut bid_size =
+            (base_size * bid_fill_multiplier * bid_size_skew * ob_bid_size_mult).max(Decimal::ZERO);
+        let mut ask_size =
+            (base_size * ask_fill_multiplier * ask_size_skew * ob_ask_size_mult).max(Decimal::ZERO);
 
         // S4: graduated toxic-flow sided reduction / safe-side boost.
         if flow_dir > Decimal::ZERO {
