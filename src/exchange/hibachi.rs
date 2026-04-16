@@ -376,6 +376,8 @@ impl HibachiClient {
                     symbol,
                     bid: parse_decimal(&data["bidPrice"])?,
                     ask: parse_decimal(&data["askPrice"])?,
+                    bid_size: None,
+                    ask_size: None,
                     timestamp,
                 });
             }

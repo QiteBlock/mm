@@ -305,6 +305,13 @@ where
         let mut minute_stats = MinuteStats::default();
         // Issue 6: per-(symbol, side) cooldown after toxic fills.
         let mut side_cooldown: HashMap<(String, Side), Instant> = HashMap::new();
+        // Per-symbol flow-spike unwind commitment: once set, forces unwind-only
+        // quoting until the position is fully cleared, even if flow briefly dips
+        // below the spike threshold (prevents oscillation around the threshold).
+        let mut flow_spike_committed: HashSet<String> = HashSet::new();
+        // Post-fill widen: tracks (symbol, side_to_widen) → Instant when widen expires.
+        // After a fill on side S, widen the opposite side for post_fill_widen_secs.
+        let mut post_fill_widen: HashMap<(String, Side), Instant> = HashMap::new();
         // Issue 9: pause quoting 3s after a WS reconnect to let state settle.
         let mut reconnect_pause_until: Option<Instant> = None;
 
@@ -337,7 +344,15 @@ where
                                 toxicity = %fs.toxicity_score,
                                 "toxic fill; cooling down side for 3 s"
                             );
-                            side_cooldown.insert((fs.fill_symbol, fs.fill_side), Instant::now());
+                            side_cooldown.insert((fs.fill_symbol.clone(), fs.fill_side), Instant::now());
+                        }
+                        // Post-fill widen: widen opposite side for N seconds.
+                        let widen_secs = self.parsed.model.post_fill_widen_secs;
+                        let widen_mult = self.parsed.model.post_fill_widen_multiplier;
+                        if widen_secs > 0 && widen_mult > Decimal::ONE {
+                            let opposite = fs.fill_side.opposite();
+                            let expiry = Instant::now() + Duration::from_secs(widen_secs);
+                            post_fill_widen.insert((fs.fill_symbol, opposite), expiry);
                         }
                     }
                 }
@@ -377,7 +392,15 @@ where
                                     toxicity = %fs.toxicity_score,
                                     "toxic fill during cycle drain; cooling down side for 3 s"
                                 );
-                                side_cooldown.insert((fs.fill_symbol, fs.fill_side), Instant::now());
+                                side_cooldown.insert((fs.fill_symbol.clone(), fs.fill_side), Instant::now());
+                            }
+                            // Post-fill widen on opposite side.
+                            let widen_secs = self.parsed.model.post_fill_widen_secs;
+                            let widen_mult = self.parsed.model.post_fill_widen_multiplier;
+                            if widen_secs > 0 && widen_mult > Decimal::ONE {
+                                let opposite = fs.fill_side.opposite();
+                                let expiry = Instant::now() + Duration::from_secs(widen_secs);
+                                post_fill_widen.insert((fs.fill_symbol, opposite), expiry);
                             }
                         }
                     }
@@ -497,7 +520,17 @@ where
                         health.rest_failure_count(),
                         &emergency_unwind_symbols,
                         &side_cooldown,
+                        &mut flow_spike_committed,
+                        &post_fill_widen,
                     )?;
+                    // Online kappa: record a quote cycle for each enabled pair.
+                    for pair in self.config.pairs.iter().filter(|p| p.enabled) {
+                        fill_tracker.record_quote_cycle(&pair.symbol);
+                    }
+                    // Purge expired post-fill widen entries.
+                    let now_inst = Instant::now();
+                    post_fill_widen.retain(|_, &mut exp| now_inst < exp);
+
                     minute_stats.record_position_sample(&self.config, &state);
                     log_quote_competitiveness(&state, &desired);
 
@@ -696,6 +729,7 @@ where
                             MarketEvent::OrderBookSnapshot { symbol, .. } => { deduped.insert((symbol.clone(), 3), e); }
                             MarketEvent::OrderBookUpdate { symbol, .. } => { deduped.insert((symbol.clone(), 4), e); }
                             MarketEvent::StreamReconnected { .. } => { deduped.insert((String::new(), 255), e); }
+                            MarketEvent::FundingRate { symbol, .. } => { deduped.insert((symbol.clone(), 5), e); }
                         }
                     }
                     let all_events: Vec<MarketEvent> = deduped.into_values().chain(trade_events).collect();
@@ -758,6 +792,14 @@ where
                                         true,
                                         &mut fill_tracker,
                                     ).await?;
+                                    // Post-fill widen for simulated fills.
+                                    let widen_secs = self.parsed.model.post_fill_widen_secs;
+                                    let widen_mult = self.parsed.model.post_fill_widen_multiplier;
+                                    if widen_secs > 0 && widen_mult > Decimal::ONE {
+                                        let opposite = fs.fill_side.opposite();
+                                        let expiry = Instant::now() + Duration::from_secs(widen_secs);
+                                        post_fill_widen.insert((fs.fill_symbol.clone(), opposite), expiry);
+                                    }
                                     minute_stats.accumulate_fill(fs);
                                 }
                         }
@@ -988,6 +1030,8 @@ where
         rest_failures: usize,
         emergency_unwind_symbols: &HashSet<String>,
         side_cooldown: &HashMap<(String, Side), Instant>,
+        flow_spike_committed: &mut HashSet<String>,
+        post_fill_widen: &HashMap<(String, Side), Instant>,
     ) -> Result<Vec<OrderRequest>> {
         let mut orders = Vec::new();
         let vol_cut = self.parsed.model.volatility_cut_threshold;
@@ -996,11 +1040,28 @@ where
 
         for pair in self.config.pairs.iter().filter(|pair| pair.enabled) {
             let Some(mut factor_snapshot) =
-                factors.compute(&self.config, &self.parsed, pair, state)
+                factors.compute(&self.config, &self.parsed, pair, state, fill_tracker)
             else {
                 info!(symbol = %pair.symbol, "factor snapshot unavailable; skipping symbol");
                 continue;
             };
+            // Populate post-fill widen multipliers.
+            let now_inst = Instant::now();
+            let widen_mult = self.parsed.model.post_fill_widen_multiplier;
+            if widen_mult > Decimal::ONE {
+                if post_fill_widen.get(&(pair.symbol.clone(), Side::Bid))
+                    .map(|&exp| now_inst < exp)
+                    .unwrap_or(false)
+                {
+                    factor_snapshot.post_fill_widen_bid = widen_mult;
+                }
+                if post_fill_widen.get(&(pair.symbol.clone(), Side::Ask))
+                    .map(|&exp| now_inst < exp)
+                    .unwrap_or(false)
+                {
+                    factor_snapshot.post_fill_widen_ask = widen_mult;
+                }
+            }
             let current_position = state
                 .positions
                 .get(&pair.symbol)
@@ -1044,25 +1105,47 @@ where
                 }
             }
 
-            // Flow spike pause — only trigger after ≥ 2 consecutive cycles above the
-            // threshold.  Oscillating flow (e.g. bouncing either side of 0.7) would
-            // otherwise repeatedly cancel exit orders and keep positions stuck.
+            // Flow spike pause — latch-based to prevent oscillation.
+            // Enter: ≥2 consecutive cycles above threshold.
+            // Exit: position cleared to zero (commitment released only when flat).
             let flow_spike_threshold = self.parsed.factors.flow_spike_pause_threshold;
-            if flow_spike_threshold > Decimal::ZERO
-                && factor_snapshot.flow_direction.abs() > flow_spike_threshold
-                && factor_snapshot.consecutive_flow_spike >= 2
-            {
-                if has_position {
-                    warn!(
-                        symbol = %pair.symbol,
-                        position = %current_position,
-                        flow_direction = %factor_snapshot.flow_direction,
-                        threshold = %flow_spike_threshold,
-                        consecutive_cycles = factor_snapshot.consecutive_flow_spike,
-                        "sustained flow spike while holding position; switching to unwind-only quoting"
-                    );
-                    unwind_only = true;
-                } else {
+            if flow_spike_threshold > Decimal::ZERO {
+                let spike_active = factor_snapshot.flow_direction.abs() > flow_spike_threshold
+                    && factor_snapshot.consecutive_flow_spike >= 2;
+
+                // Commit on new spike; release only once position is flat.
+                if spike_active && has_position {
+                    if flow_spike_committed.insert(pair.symbol.clone()) {
+                        warn!(
+                            symbol = %pair.symbol,
+                            position = %current_position,
+                            flow_direction = %factor_snapshot.flow_direction,
+                            threshold = %flow_spike_threshold,
+                            consecutive_cycles = factor_snapshot.consecutive_flow_spike,
+                            "sustained flow spike; committing to unwind-only until flat"
+                        );
+                    }
+                } else if !has_position {
+                    flow_spike_committed.remove(&pair.symbol);
+                }
+
+                if flow_spike_committed.contains(&pair.symbol) {
+                    if has_position {
+                        warn!(
+                            symbol = %pair.symbol,
+                            position = %current_position,
+                            flow_direction = %factor_snapshot.flow_direction,
+                            committed = true,
+                            "flow spike committed; unwind-only quoting"
+                        );
+                        unwind_only = true;
+                    } else {
+                        // Position is flat — commitment already cleared above; skip new quotes
+                        // this cycle so we don't immediately re-enter.
+                        continue;
+                    }
+                } else if spike_active {
+                    // No position, spike just triggered (not yet committed) — suppress quotes.
                     warn!(
                         symbol = %pair.symbol,
                         flow_direction = %factor_snapshot.flow_direction,
@@ -1138,6 +1221,16 @@ where
                 best_ask,
                 pos_ratio,
             );
+
+            // Online kappa: record whether a level-0 fill happened this cycle.
+            // A level-0 fill means the tracker saw a fill at level_index=0 for this symbol.
+            // Proxy: check if a fill was recorded since last cycle using toxicity decay.
+            // Simpler: just record the cycle every tick; fill events call record_fill separately.
+            // We track was_filled_l0 = toxicity score changed from previous (approximation).
+            // For now: always record as not-filled; fill events update via record_fill.
+            // The kappa_tracker EWMA blends in the fill signal from record_fill automatically.
+            // NOTE: record_quote_cycle is called here but fill_tracker is immutable in this fn.
+            // Use a separate mutable pass — moved to the engine run loop (see below).
 
             // A-S prices from generate_quotes are already final — no tick improvement override.
 
@@ -2161,17 +2254,20 @@ fn infer_fill_analytics(state: &BotState, fill: &Fill) -> (usize, Decimal) {
         })
         .unwrap_or(0);
 
+    // Use mid price as the reference for spread_earned so the denominator
+    // reflects our actual edge from fair value (e.g. 5-20 bps), not the full
+    // bid-ask spread (which can be 100+ bps on wide markets like GRVT perps).
+    // With the old opposite-BBO reference, even a 50 bps adverse move gave
+    // toxicity_ratio < 1 when the spread was 80+ bps — so is_toxic was always
+    // false and side_cooldown could never trigger.
     let spread_earned_bps = if let Some(market) = state.market.symbols.get(&fill.symbol) {
-        let opposite_bbo = match fill.side {
-            Side::Bid => market.best_ask,
-            Side::Ask => market.best_bid,
-        };
-        if let Some(reference) = opposite_bbo.filter(|reference| *reference > Decimal::ZERO) {
+        let mid = market.mid_price().filter(|&m| m > Decimal::ZERO);
+        if let Some(mid) = mid {
             let edge = match fill.side {
-                Side::Bid => reference - fill.price,
-                Side::Ask => fill.price - reference,
+                Side::Bid => mid - fill.price,   // how far below mid we bought
+                Side::Ask => fill.price - mid,   // how far above mid we sold
             };
-            (edge / reference * Decimal::from(10_000u64)).max(Decimal::ZERO)
+            (edge / mid * Decimal::from(10_000u64)).max(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }
@@ -2202,6 +2298,7 @@ fn market_reference(
             bid,
             ask,
             timestamp,
+            ..
         } => Some((
             symbol.clone(),
             (*bid + *ask) / Decimal::from(2u64),
@@ -2240,7 +2337,7 @@ fn market_reference(
                 _ => None,
             }
         }
-        MarketEvent::StreamReconnected { .. } => None,
+        MarketEvent::StreamReconnected { .. } | MarketEvent::FundingRate { .. } => None,
     }
 }
 

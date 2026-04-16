@@ -132,6 +132,16 @@ pub enum MarketEvent {
         symbol: String,
         bid: Decimal,
         ask: Decimal,
+        /// BBO queue sizes from the exchange (e.g. GRVT v1.mini.d `bq`/`aq`).
+        /// None when the venue doesn't publish BBO depths.
+        bid_size: Option<Decimal>,
+        ask_size: Option<Decimal>,
+        timestamp: DateTime<Utc>,
+    },
+    FundingRate {
+        symbol: String,
+        /// Signed periodic funding rate (positive = longs pay shorts).
+        rate: Decimal,
         timestamp: DateTime<Utc>,
     },
     Trade {
@@ -171,7 +181,7 @@ pub enum PrivateEvent {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FactorSnapshot {
     pub price_index: Decimal,
     pub raw_volatility: Decimal,
@@ -191,6 +201,50 @@ pub struct FactorSnapshot {
     /// Consecutive factor cycles where |flow_direction| exceeded flow_spike_pause_threshold.
     /// The engine requires ≥ 2 before suppressing quotes to prevent oscillating-flow false positives.
     pub consecutive_flow_spike: u32,
+    /// BBO size-weighted mid (microprice). Falls back to raw mid when BBO sizes are unavailable.
+    /// Used as the primary fair-value estimate in distribution.
+    pub microprice: Decimal,
+    /// Signed fill-rate skew [-1, 1]: positive = bid fills faster, negative = ask fills faster.
+    /// Derived from a rolling window of bid vs ask fill counts.
+    pub fill_rate_skew: Decimal,
+    /// VPIN ∈ [0, 1]: high values indicate informed trading / adverse selection risk.
+    pub vpin: Decimal,
+    /// Funding-rate lean in bps: positive shifts reservation ask-ward (collect long funding),
+    /// negative shifts it bid-ward. Zero when funding data is absent or weight = 0.
+    pub funding_lean: Decimal,
+    /// Online kappa estimate from empirical fill probability at level 0.
+    /// None until enough cycles have been observed (controlled by `kappa_min_cycles`).
+    pub kappa_estimate: Option<Decimal>,
+    /// Post-fill spread widen multiplier for the bid side (1.0 = normal, > 1.0 = wider).
+    /// Populated by the engine after a recent ask fill triggers the post-fill window.
+    pub post_fill_widen_bid: Decimal,
+    /// Post-fill spread widen multiplier for the ask side.
+    pub post_fill_widen_ask: Decimal,
+}
+
+impl Default for FactorSnapshot {
+    fn default() -> Self {
+        Self {
+            price_index: Decimal::ZERO,
+            raw_volatility: Decimal::ZERO,
+            volatility: Decimal::ZERO,
+            volume_imbalance: Decimal::ZERO,
+            flow_direction: Decimal::ZERO,
+            inventory_skew: Decimal::ZERO,
+            recent_trade_count: 0,
+            regime: MarketRegime::default(),
+            regime_intensity: Decimal::ZERO,
+            ob_imbalance: Decimal::ZERO,
+            consecutive_flow_spike: 0,
+            microprice: Decimal::ZERO,
+            fill_rate_skew: Decimal::ZERO,
+            vpin: Decimal::ZERO,
+            funding_lean: Decimal::ZERO,
+            kappa_estimate: None,
+            post_fill_widen_bid: Decimal::ONE,
+            post_fill_widen_ask: Decimal::ONE,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

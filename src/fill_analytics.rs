@@ -1,7 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
+use tracing::debug;
 
 use crate::domain::Side;
 
@@ -12,10 +13,165 @@ fn neutral_score() -> Decimal {
     Decimal::new(5, 1)
 }
 
+// ─── Post-fill price tracking ────────────────────────────────────────────────
+
+/// Tracks price at 1s / 5s / 30s after each fill for toxicity diagnostics.
+struct PostFillObservation {
+    symbol: String,
+    side: Side,
+    fill_price: Decimal,
+    timestamp: DateTime<Utc>,
+    price_1s: Option<Decimal>,
+    price_5s: Option<Decimal>,
+    price_30s: Option<Decimal>,
+}
+
+impl PostFillObservation {
+    /// Feed a price observation at `now`. Returns true once all three snapshots
+    /// have been taken (the entry can then be removed).
+    fn observe(&mut self, price: Decimal, now: DateTime<Utc>) -> bool {
+        let elapsed = (now - self.timestamp).num_milliseconds();
+        if elapsed >= 1_000 && self.price_1s.is_none() {
+            self.price_1s = Some(price);
+        }
+        if elapsed >= 5_000 && self.price_5s.is_none() {
+            self.price_5s = Some(price);
+        }
+        if elapsed >= 30_000 && self.price_30s.is_none() {
+            self.price_30s = Some(price);
+            return true; // all done
+        }
+        false
+    }
+
+    fn log_if_complete(&self) {
+        let Some(p30) = self.price_30s else { return };
+        let Some(p5) = self.price_5s else { return };
+        let Some(p1) = self.price_1s else { return };
+        let base = self.fill_price;
+        if base <= Decimal::ZERO { return; }
+        let bps = |p: Decimal| {
+            let raw = match self.side {
+                Side::Bid => (base - p) / base,
+                Side::Ask => (p - base) / base,
+            };
+            raw * Decimal::from(10_000u64)
+        };
+        debug!(
+            symbol = %self.symbol,
+            side = ?self.side,
+            fill_price = %base,
+            adverse_1s_bps = %bps(p1),
+            adverse_5s_bps = %bps(p5),
+            adverse_30s_bps = %bps(p30),
+            "post-fill price observations"
+        );
+    }
+}
+
+// ─── Fill-rate tracker ────────────────────────────────────────────────────────
+
+/// Per-symbol rolling fill-rate counts used to detect bid/ask asymmetry.
+struct FillRateState {
+    bid_timestamps: VecDeque<DateTime<Utc>>,
+    ask_timestamps: VecDeque<DateTime<Utc>>,
+}
+
+impl FillRateState {
+    fn record(&mut self, side: Side, now: DateTime<Utc>) {
+        match side {
+            Side::Bid => self.bid_timestamps.push_back(now),
+            Side::Ask => self.ask_timestamps.push_back(now),
+        }
+    }
+
+    fn purge_old(&mut self, cutoff: DateTime<Utc>) {
+        while self.bid_timestamps.front().map(|&t| t < cutoff).unwrap_or(false) {
+            self.bid_timestamps.pop_front();
+        }
+        while self.ask_timestamps.front().map(|&t| t < cutoff).unwrap_or(false) {
+            self.ask_timestamps.pop_front();
+        }
+    }
+
+    /// Signed [-1, 1]: positive = bid fills faster.
+    fn skew(&self, window_secs: i64, threshold: Decimal, now: DateTime<Utc>) -> Decimal {
+        let cutoff = now - Duration::seconds(window_secs);
+        let bid = self.bid_timestamps.iter().filter(|&&t| t >= cutoff).count() as u64;
+        let ask = self.ask_timestamps.iter().filter(|&&t| t >= cutoff).count() as u64;
+        let bid_d = Decimal::from(bid + 1); // +1 Laplace smoothing
+        let ask_d = Decimal::from(ask + 1);
+        let ratio = bid_d / ask_d;
+        if ratio > threshold {
+            // bid fills much faster — clamp to 1
+            (ratio / threshold - Decimal::ONE).min(Decimal::ONE)
+        } else if ask_d / bid_d > threshold {
+            -((ask_d / bid_d) / threshold - Decimal::ONE).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        }
+    }
+}
+
+impl Default for FillRateState {
+    fn default() -> Self {
+        Self {
+            bid_timestamps: VecDeque::new(),
+            ask_timestamps: VecDeque::new(),
+        }
+    }
+}
+
+// ─── Online kappa tracker ─────────────────────────────────────────────────────
+
+/// Per-symbol EWMA-based fill-probability estimator at level 0.
+/// Derives an online κ from `P(fill) ≈ exp(-κ · δ/2)`.
+struct KappaState {
+    /// EWMA of was-filled (1.0) vs not-filled (0.0) at level 0.
+    fill_prob_ewma: Option<Decimal>,
+    cycles: u64,
+}
+
+impl KappaState {
+    fn record_cycle(&mut self, was_filled: bool) {
+        let alpha = Decimal::new(5, 2); // 0.05
+        let sample = if was_filled { Decimal::ONE } else { Decimal::ZERO };
+        self.fill_prob_ewma = Some(match self.fill_prob_ewma {
+            None => sample,
+            Some(prev) => alpha * sample + (Decimal::ONE - alpha) * prev,
+        });
+        self.cycles += 1;
+    }
+
+    /// Returns estimated κ given the level-0 half-spread fraction.
+    fn kappa_estimate(&self, min_cycles: u64, half_spread_frac: Decimal) -> Option<Decimal> {
+        use rust_decimal::MathematicalOps;
+        if self.cycles < min_cycles { return None; }
+        let prob = self.fill_prob_ewma?;
+        let prob_clamped = prob.clamp(Decimal::new(1, 4), Decimal::new(9999, 4)); // [0.0001, 0.9999]
+        if half_spread_frac <= Decimal::ZERO { return None; }
+        let neg_ln = -(prob_clamped.ln());
+        Some((neg_ln / half_spread_frac).max(Decimal::new(1, 1))) // kappa >= 0.1
+    }
+}
+
+impl Default for KappaState {
+    fn default() -> Self {
+        Self { fill_prob_ewma: None, cycles: 0 }
+    }
+}
+
+// ─── Main FillTracker ────────────────────────────────────────────────────────
+
 #[derive(Default)]
 pub struct FillTracker {
     pending: VecDeque<TrackedFill>,
     scores: HashMap<String, HashMap<(Side, usize), LevelToxicityScore>>,
+    post_fill: HashMap<String, Vec<PostFillObservation>>,
+    fill_rate: HashMap<String, FillRateState>,
+    kappa: HashMap<String, KappaState>,
+    /// Symbols that had a level-0 fill since the last `record_quote_cycle` call.
+    pending_l0_fills: HashSet<String>,
 }
 
 impl FillTracker {
@@ -28,14 +184,38 @@ impl FillTracker {
         spread_earned_bps: Decimal,
         timestamp: DateTime<Utc>,
     ) {
+        // Record for toxicity scoring.
         self.pending.push_back(TrackedFill {
-            symbol,
+            symbol: symbol.clone(),
             side,
             level_index,
             fill_price,
             spread_earned_bps: spread_earned_bps.max(Decimal::new(1, 6)),
             timestamp,
         });
+        // Record level-0 fill for online kappa estimation.
+        if level_index == 0 {
+            self.pending_l0_fills.insert(symbol.clone());
+        }
+        // Record for post-fill price tracking.
+        self.post_fill.entry(symbol.clone()).or_default().push(PostFillObservation {
+            symbol: symbol.clone(),
+            side,
+            fill_price,
+            timestamp,
+            price_1s: None,
+            price_5s: None,
+            price_30s: None,
+        });
+        // Record for fill-rate asymmetry.
+        self.fill_rate.entry(symbol).or_default().record(side, timestamp);
+    }
+
+    /// Call every reconcile cycle for each quoted symbol.
+    /// Consumes any pending level-0 fill recorded by `record_fill`.
+    pub fn record_quote_cycle(&mut self, symbol: &str) {
+        let was_filled = self.pending_l0_fills.remove(symbol);
+        self.kappa.entry(symbol.to_string()).or_default().record_cycle(was_filled);
     }
 
     pub fn observe_price(
@@ -48,6 +228,7 @@ impl FillTracker {
             return;
         }
 
+        // Toxicity observation (15-second window).
         let mut finished = Vec::new();
         let mut remaining = VecDeque::with_capacity(self.pending.len());
         while let Some(tracked) = self.pending.pop_front() {
@@ -55,7 +236,6 @@ impl FillTracker {
                 remaining.push_back(tracked);
                 continue;
             }
-
             if timestamp - tracked.timestamp >= Duration::seconds(OBSERVATION_WINDOW_SECS) {
                 finished.push((tracked, reference_price, timestamp));
             } else {
@@ -75,6 +255,20 @@ impl FillTracker {
                 .or_default();
             score.apply(toxicity_ratio, observed_at);
         }
+
+        // Post-fill price observations (1s / 5s / 30s).
+        if let Some(observations) = self.post_fill.get_mut(symbol) {
+            let mut keep = Vec::new();
+            for mut obs in observations.drain(..) {
+                let done = obs.observe(reference_price, timestamp);
+                if done {
+                    obs.log_if_complete();
+                } else {
+                    keep.push(obs);
+                }
+            }
+            *observations = keep;
+        }
     }
 
     pub fn decay(&mut self, now: DateTime<Utc>) {
@@ -82,6 +276,11 @@ impl FillTracker {
             for score in levels.values_mut() {
                 score.decay(now);
             }
+        }
+        // Purge old fill-rate timestamps (keep last hour).
+        let cutoff = now - Duration::hours(1);
+        for state in self.fill_rate.values_mut() {
+            state.purge_old(cutoff);
         }
     }
 
@@ -95,11 +294,25 @@ impl FillTracker {
 
     pub fn level_volume_multiplier(&self, symbol: &str, side: Side, level_index: usize) -> Decimal {
         let score = self.toxicity_score(symbol, side, level_index);
-        // Softer curve: neutral score (0.5) → 1.0×, score=1.5 → 0.5×, score=0.0 → 1.5×.
-        // A single bad fill (score ~0.75) only reduces size to ~0.85×, not 0.5×.
         (Decimal::TWO - score).clamp(Decimal::new(5, 1), Decimal::new(15, 1))
     }
+
+    /// Signed fill-rate skew [-1, 1]: positive = bid fills faster.
+    pub fn fill_rate_skew(&self, symbol: &str, window_secs: i64, threshold: Decimal) -> Decimal {
+        self.fill_rate
+            .get(symbol)
+            .map(|s| s.skew(window_secs, threshold, Utc::now()))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// Online kappa estimate from empirical fill probability at level 0.
+    /// Returns None until `min_cycles` have been observed.
+    pub fn kappa_estimate(&self, symbol: &str, min_cycles: u64, half_spread_frac: Decimal) -> Option<Decimal> {
+        self.kappa.get(symbol)?.kappa_estimate(min_cycles, half_spread_frac)
+    }
 }
+
+// ─── Internal structs ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct TrackedFill {

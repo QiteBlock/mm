@@ -146,6 +146,18 @@ impl AppConfig {
                 as_time_horizon: parse_decimal("model.as_time_horizon", &self.model.as_time_horizon)?,
                 inventory_lean_bps: parse_decimal("model.inventory_lean_bps", &self.model.inventory_lean_bps)?,
                 as_vol_cap: parse_decimal("model.as_vol_cap", &self.model.as_vol_cap)?,
+                fill_rate_window_secs: parse_decimal("model.fill_rate_window_secs", &self.model.fill_rate_window_secs)?,
+                fill_rate_skew_threshold: parse_decimal("model.fill_rate_skew_threshold", &self.model.fill_rate_skew_threshold)?,
+                fill_rate_competitive_bps: parse_decimal("model.fill_rate_competitive_bps", &self.model.fill_rate_competitive_bps)?,
+                vpin_widen_multiplier: parse_decimal("model.vpin_widen_multiplier", &self.model.vpin_widen_multiplier)?,
+                funding_lean_weight: parse_decimal("model.funding_lean_weight", &self.model.funding_lean_weight)?,
+                post_fill_widen_secs: self.model.post_fill_widen_secs.parse::<u64>()
+                    .with_context(|| "invalid u64 for model.post_fill_widen_secs")?,
+                post_fill_widen_multiplier: parse_decimal("model.post_fill_widen_multiplier", &self.model.post_fill_widen_multiplier)?,
+                online_kappa: self.model.online_kappa.parse::<bool>()
+                    .with_context(|| "invalid bool for model.online_kappa")?,
+                kappa_min_cycles: self.model.kappa_min_cycles.parse::<u64>()
+                    .with_context(|| "invalid u64 for model.kappa_min_cycles")?,
             },
             risk: ParsedRiskConfig {
                 max_abs_position_usd: parse_decimal(
@@ -250,6 +262,23 @@ impl AppConfig {
                     "factors.flow_spike_pause_threshold",
                     &self.factors.flow_spike_pause_threshold,
                 )?,
+                microprice_weight: parse_decimal(
+                    "factors.microprice_weight",
+                    &self.factors.microprice_weight,
+                )?.clamp(Decimal::ZERO, Decimal::ONE),
+                cex_reference_lean_weight: parse_decimal(
+                    "factors.cex_reference_lean_weight",
+                    &self.factors.cex_reference_lean_weight,
+                )?,
+                vpin_bucket_size: parse_decimal(
+                    "factors.vpin_bucket_size",
+                    &self.factors.vpin_bucket_size,
+                )?,
+                vpin_n_buckets: self.factors.vpin_n_buckets,
+                vpin_widen_threshold: parse_decimal(
+                    "factors.vpin_widen_threshold",
+                    &self.factors.vpin_widen_threshold,
+                )?,
             },
             pairs: self
                 .pairs
@@ -335,6 +364,24 @@ pub struct ParsedModelConfig {
     /// Hard cap on vol_per_cycle fed into the A-S formula, preventing BBO noise
     /// from inflating spreads while genuine volatility still widens them naturally.
     pub as_vol_cap: Decimal,
+    /// Rolling window (seconds) for fill-rate asymmetry tracking.
+    pub fill_rate_window_secs: Decimal,
+    /// Ratio threshold that triggers fill-rate competitive skew.
+    pub fill_rate_skew_threshold: Decimal,
+    /// Extra competitiveness added on the slow-filling side (bps).
+    pub fill_rate_competitive_bps: Decimal,
+    /// Spread multiplier at VPIN = 1 (linear interpolation above vpin_widen_threshold).
+    pub vpin_widen_multiplier: Decimal,
+    /// Funding-rate lean weight.
+    pub funding_lean_weight: Decimal,
+    /// Seconds to widen the opposite side after a fill.
+    pub post_fill_widen_secs: u64,
+    /// Spread multiplier during the post-fill widen window.
+    pub post_fill_widen_multiplier: Decimal,
+    /// Use online kappa estimate when available.
+    pub online_kappa: bool,
+    /// Minimum quote cycles before online kappa is trusted.
+    pub kappa_min_cycles: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -379,6 +426,16 @@ pub struct ParsedFactorConfig {
     /// |flow_direction| above this value pauses quoting for the symbol.
     /// 0 = disabled. Typical: 0.7.
     pub flow_spike_pause_threshold: Decimal,
+    /// Blend weight for microprice vs raw mid [0, 1].
+    pub microprice_weight: Decimal,
+    /// Weight applied to (microprice - grvt_mid) when anchoring to CEX spot.
+    pub cex_reference_lean_weight: Decimal,
+    /// Volume per VPIN bucket. 0 = VPIN disabled.
+    pub vpin_bucket_size: Decimal,
+    /// Number of VPIN buckets in the rolling window.
+    pub vpin_n_buckets: usize,
+    /// VPIN threshold above which quotes widen.
+    pub vpin_widen_threshold: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -531,6 +588,38 @@ fn default_regime_intensity_alpha() -> String {
     "0.2".to_string()
 }
 
+fn default_microprice_weight() -> String {
+    "1.0".to_string()
+}
+
+fn default_vpin_bucket_size() -> String {
+    "0".to_string()
+}
+
+fn default_vpin_n_buckets() -> usize {
+    20
+}
+
+fn default_fill_rate_window_secs() -> String {
+    "300".to_string()
+}
+
+fn default_fill_rate_skew_threshold() -> String {
+    "3.0".to_string()
+}
+
+fn default_one_string() -> String {
+    "1.0".to_string()
+}
+
+fn default_false_string() -> String {
+    "false".to_string()
+}
+
+fn default_kappa_min_cycles() -> String {
+    "100".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub dry_run: bool,
@@ -599,6 +688,35 @@ pub struct ModelConfig {
     /// Hard cap on vol_per_cycle fed into the A-S formula (e.g. "0.010" = 1%).
     #[serde(default = "default_as_vol_cap")]
     pub as_vol_cap: String,
+    /// Rolling window (seconds) for fill-rate asymmetry tracking.
+    #[serde(default = "default_fill_rate_window_secs")]
+    pub fill_rate_window_secs: String,
+    /// Ratio of bid/ask fill rate that triggers competitive skew (e.g. "3.0").
+    #[serde(default = "default_fill_rate_skew_threshold")]
+    pub fill_rate_skew_threshold: String,
+    /// Extra spread competitiveness added on the slow-filling side when skew triggers (bps).
+    #[serde(default = "default_zero_string")]
+    pub fill_rate_competitive_bps: String,
+    /// Spread multiplier applied when VPIN ≥ vpin_widen_threshold (at VPIN=1). 1 = disabled.
+    #[serde(default = "default_one_string")]
+    pub vpin_widen_multiplier: String,
+    /// Weight for funding-rate lean. At weight=1 the funding rate (bps/hour) directly shifts
+    /// the reservation price. 0 = disabled.
+    #[serde(default = "default_zero_string")]
+    pub funding_lean_weight: String,
+    /// Seconds to widen the opposite side after a fill. 0 = disabled.
+    #[serde(default = "default_zero_string")]
+    pub post_fill_widen_secs: String,
+    /// Spread multiplier on the post-fill side during the widen window. 1 = no widen.
+    #[serde(default = "default_one_string")]
+    pub post_fill_widen_multiplier: String,
+    /// Enable online kappa estimation from empirical fill probability.
+    /// When enabled, replaces as_kappa once enough cycles are observed.
+    #[serde(default = "default_false_string")]
+    pub online_kappa: String,
+    /// Minimum quote cycles before online kappa estimate is trusted.
+    #[serde(default = "default_kappa_min_cycles")]
+    pub kappa_min_cycles: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -665,6 +783,23 @@ pub struct FactorConfig {
     /// |flow_direction| above this threshold pauses quoting. 0 = disabled.
     #[serde(default = "default_flow_spike_pause_threshold")]
     pub flow_spike_pause_threshold: String,
+    /// Blend weight for microprice vs raw mid [0, 1]. 1 = full microprice, 0 = raw mid.
+    /// Requires BBO size data from the venue (GRVT v1.mini.d `bq`/`aq`).
+    #[serde(default = "default_microprice_weight")]
+    pub microprice_weight: String,
+    /// Weight applied to (microprice - grvt_mid) added to CEX spot when price_source=spot.
+    /// 0 = pure CEX price, 1 = CEX + full DEX book-pressure lean.
+    #[serde(default = "default_zero_string")]
+    pub cex_reference_lean_weight: String,
+    /// Volume per VPIN bucket (in base currency). 0 = disabled.
+    #[serde(default = "default_vpin_bucket_size")]
+    pub vpin_bucket_size: String,
+    /// Number of completed VPIN buckets in the rolling window.
+    #[serde(default = "default_vpin_n_buckets")]
+    pub vpin_n_buckets: usize,
+    /// VPIN level above which spreads widen by `vpin_widen_multiplier`. 0 = disabled.
+    #[serde(default = "default_zero_string")]
+    pub vpin_widen_threshold: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

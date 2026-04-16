@@ -1,18 +1,77 @@
 use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use rust_decimal::{Decimal, MathematicalOps};
+use rust_decimal::{prelude::ToPrimitive, Decimal, MathematicalOps};
 use tracing::debug;
 
 use crate::{
     config::{AppConfig, PairConfig, ParsedConfig, PriceSource},
     domain::{FactorSnapshot, MarketRegime, RecentTrade},
+    fill_analytics::FillTracker,
     state::BotState,
 };
+
+// ─── VPIN tracker ────────────────────────────────────────────────────────────
+
+/// Volume-synchronised probability of informed trading (VPIN).
+/// Accumulates trades into equal-volume buckets; each bucket's buy/sell
+/// imbalance is the informed-trading estimate for that volume epoch.
+struct VpinTracker {
+    bucket_size: Decimal,
+    current_buy: Decimal,
+    current_sell: Decimal,
+    buckets: VecDeque<Decimal>, // |imbalance| per completed bucket
+    n_buckets: usize,
+}
+
+impl VpinTracker {
+    fn new(bucket_size: Decimal, n_buckets: usize) -> Self {
+        Self {
+            bucket_size,
+            current_buy: Decimal::ZERO,
+            current_sell: Decimal::ZERO,
+            buckets: VecDeque::new(),
+            n_buckets,
+        }
+    }
+
+    fn add_trade(&mut self, buy_vol: Decimal, sell_vol: Decimal) {
+        if self.bucket_size <= Decimal::ZERO {
+            return;
+        }
+        self.current_buy += buy_vol;
+        self.current_sell += sell_vol;
+        let total = self.current_buy + self.current_sell;
+        while total >= self.bucket_size {
+            let bucket_total = self.current_buy + self.current_sell;
+            if bucket_total.is_zero() { break; }
+            let imbalance = ((self.current_buy - self.current_sell) / bucket_total).abs();
+            self.buckets.push_back(imbalance);
+            while self.buckets.len() > self.n_buckets {
+                self.buckets.pop_front();
+            }
+            // consume one bucket worth
+            let frac = self.bucket_size / bucket_total;
+            self.current_buy -= self.current_buy * frac;
+            self.current_sell -= self.current_sell * frac;
+            // clamp to zero to avoid floating-point drift
+            if self.current_buy < Decimal::ZERO { self.current_buy = Decimal::ZERO; }
+            if self.current_sell < Decimal::ZERO { self.current_sell = Decimal::ZERO; }
+            break; // process at most one bucket per trade to avoid infinite loops
+        }
+    }
+
+    fn vpin(&self) -> Decimal {
+        if self.buckets.is_empty() { return Decimal::ZERO; }
+        let sum: Decimal = self.buckets.iter().sum();
+        sum / Decimal::from(self.buckets.len() as u64)
+    }
+}
 
 #[derive(Default)]
 pub struct FactorEngine {
     symbol_state: HashMap<String, SymbolFactorState>,
+    vpin_trackers: HashMap<String, VpinTracker>,
 }
 
 struct SymbolFactorState {
@@ -64,9 +123,17 @@ impl FactorEngine {
         parsed: &ParsedConfig,
         pair: &PairConfig,
         state: &BotState,
+        fill_tracker: &FillTracker,
     ) -> Option<FactorSnapshot> {
         let market = state.market.symbols.get(&pair.symbol)?;
-        let mid = market.mid_price()?;
+        // Use microprice (BBO size-weighted mid) when available, blended by config weight.
+        let raw_mid = market.mid_price()?;
+        let mid = if let Some(mp) = market.microprice() {
+            let w = parsed.factors.microprice_weight;
+            w * mp + (Decimal::ONE - w) * raw_mid
+        } else {
+            raw_mid
+        };
         let now = market.last_updated?;
         let symbol_state = self.symbol_state.entry(pair.symbol.clone()).or_default();
         let alpha = parsed.factors.volatility_ewma_alpha;
@@ -119,6 +186,20 @@ impl FactorEngine {
             .iter()
             .filter(|trade| trade.timestamp >= n_trade_window_start)
             .count();
+
+        // VPIN: feed this window's buy/sell volume into the per-symbol bucket tracker.
+        if parsed.factors.vpin_bucket_size > Decimal::ZERO {
+            let vpin_tracker = self
+                .vpin_trackers
+                .entry(pair.symbol.clone())
+                .or_insert_with(|| VpinTracker::new(parsed.factors.vpin_bucket_size, parsed.factors.vpin_n_buckets));
+            vpin_tracker.add_trade(buy_volume, sell_volume);
+        }
+        let vpin = self
+            .vpin_trackers
+            .get(&pair.symbol)
+            .map(|t| t.vpin())
+            .unwrap_or(Decimal::ZERO);
 
         // S6: raw flow direction, signed [-1, 1], independent of volume magnitude.
         let flow_total = buy_volume + sell_volume;
@@ -242,10 +323,26 @@ impl FactorEngine {
         let regime_intensity = symbol_state.regime_intensity.min(Decimal::ONE).max(Decimal::ZERO);
 
         let time_multiplier = time_of_day_multiplier(now);
+        // Microprice (effective BBO size-weighted mid, already blended with raw_mid).
+        let microprice = mid;
         let price_index = match pair.price_source {
-            PriceSource::Mark => market.mark_price.or_else(|| market.mid_price())?,
-            PriceSource::Spot => market.spot_price.or_else(|| market.mid_price())?,
-            PriceSource::Mid => mid,
+            PriceSource::Mark => market.mark_price.or_else(|| Some(microprice))?,
+            PriceSource::Spot => {
+                if let Some(spot) = market.spot_price {
+                    let lean_weight = parsed.factors.cex_reference_lean_weight;
+                    if lean_weight > Decimal::ZERO && raw_mid > Decimal::ZERO {
+                        // Add DEX book-pressure lean to CEX anchor.
+                        // lean = (microprice - raw_mid) * weight
+                        let lean = (microprice - raw_mid) * lean_weight;
+                        spot + lean
+                    } else {
+                        spot
+                    }
+                } else {
+                    microprice
+                }
+            }
+            PriceSource::Mid => microprice,
         };
         let base_volatility_addon = factor_spread_addon(parsed, volatility);
         let volatility_addon =
@@ -307,6 +404,36 @@ impl FactorEngine {
         }
         let consecutive_flow_spike = symbol_state.consecutive_flow_spike;
 
+        // Fill-rate asymmetry: bid/ask fill rate over rolling window.
+        let window_secs = parsed.model.fill_rate_window_secs
+            .to_i64()
+            .unwrap_or(300);
+        let fill_rate_skew = fill_tracker.fill_rate_skew(
+            &pair.symbol,
+            window_secs,
+            parsed.model.fill_rate_skew_threshold,
+        );
+
+        // Online kappa: empirical fill probability at level 0.
+        let level0_half_spread_frac = parsed.model.born_inf_bps / Decimal::from(20_000u64);
+        let kappa_estimate = if parsed.model.online_kappa {
+            fill_tracker.kappa_estimate(
+                &pair.symbol,
+                parsed.model.kappa_min_cycles,
+                level0_half_spread_frac,
+            )
+        } else {
+            None
+        };
+
+        // Funding-rate lean: positive = lean ask (receive long-funding).
+        let funding_lean = if let Some(fr) = market.funding_rate {
+            // fr is the periodic rate (e.g. 8-hour); convert to bps and scale.
+            fr * Decimal::from(10_000u64) * parsed.model.funding_lean_weight
+        } else {
+            Decimal::ZERO
+        };
+
         Some(FactorSnapshot {
             price_index,
             raw_volatility: volatility,
@@ -319,6 +446,13 @@ impl FactorEngine {
             regime_intensity,
             ob_imbalance,
             consecutive_flow_spike,
+            microprice,
+            fill_rate_skew,
+            vpin,
+            funding_lean,
+            kappa_estimate,
+            post_fill_widen_bid: Decimal::ONE,  // populated by engine after compute()
+            post_fill_widen_ask: Decimal::ONE,
         })
     }
 }

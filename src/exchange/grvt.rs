@@ -743,6 +743,20 @@ impl ExchangeClient for GrvtClient {
                                 symbol: symbol.clone(),
                                 bid,
                                 ask,
+                                bid_size: result.get("best_bid_size").or_else(|| result.get("bq")).and_then(as_decimal),
+                                ask_size: result.get("best_ask_size").or_else(|| result.get("aq")).and_then(as_decimal),
+                                timestamp: now,
+                            });
+                        }
+                        if let Some(funding_rate) = result
+                            .get("funding_rate")
+                            .or_else(|| result.get("fr"))
+                            .or_else(|| result.get("fp"))
+                            .and_then(as_decimal)
+                        {
+                            events.push(MarketEvent::FundingRate {
+                                symbol: symbol.clone(),
+                                rate: funding_rate,
                                 timestamp: now,
                             });
                         }
@@ -980,12 +994,35 @@ impl GrvtClient {
     }
 
     async fn send_private_snapshot(&self, sender: &mpsc::Sender<PrivateEvent>) -> Result<()> {
+        if let Ok(equity) = self.fetch_account_equity().await {
+            info!(equity = %equity, "grvt private snapshot account equity fetched");
+            sender.send(PrivateEvent::AccountEquity { equity }).await?;
+        } else {
+            warn!("grvt account equity fetch failed; equity will remain 0");
+        }
         let open_orders = self.fetch_open_orders().await?;
         sender.send(PrivateEvent::OpenOrders(open_orders)).await?;
         for position in self.fetch_positions().await? {
             sender.send(PrivateEvent::Position(position)).await?;
         }
         Ok(())
+    }
+
+    async fn fetch_account_equity(&self) -> Result<Decimal> {
+        let response = self
+            .post_trading(
+                "/full/v1/account_summary",
+                &json!({ "sub_account_id": self.config.grvt_sub_account_id }),
+            )
+            .await?;
+        let result = response.get("result").unwrap_or(&response);
+        // GRVT returns total_equity as the net value of the sub-account.
+        result
+            .get("total_equity")
+            .or_else(|| result.get("totalEquity"))
+            .or_else(|| result.get("net_equity"))
+            .and_then(as_decimal)
+            .ok_or_else(|| anyhow::anyhow!("grvt account_summary missing total_equity field: {result}"))
     }
 
     async fn subscribe_private_streams(
@@ -1239,9 +1276,23 @@ fn parse_market_events(stream_name: &str, frame: &str) -> Result<Vec<MarketEvent
                     .and_then(as_decimal),
             ) {
                 events.push(MarketEvent::BestBidAsk {
-                    symbol: internal_symbol,
+                    symbol: internal_symbol.clone(),
                     bid,
                     ask,
+                    bid_size: feed.get("best_bid_size").or_else(|| feed.get("bq")).and_then(as_decimal),
+                    ask_size: feed.get("best_ask_size").or_else(|| feed.get("aq")).and_then(as_decimal),
+                    timestamp,
+                });
+            }
+            if let Some(funding_rate) = feed
+                .get("funding_rate")
+                .or_else(|| feed.get("fr"))
+                .or_else(|| feed.get("fp"))
+                .and_then(as_decimal)
+            {
+                events.push(MarketEvent::FundingRate {
+                    symbol: internal_symbol,
+                    rate: funding_rate,
                     timestamp,
                 });
             }

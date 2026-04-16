@@ -554,6 +554,8 @@ impl ExchangeClient for ExtendedClient {
                     symbol: market.market.clone(),
                     bid,
                     ask,
+                    bid_size: None,
+                    ask_size: None,
                     timestamp: ts,
                 });
             }
@@ -876,6 +878,8 @@ fn parse_extended_bbo_events(frame: &str, symbols: &HashSet<String>) -> Result<V
         symbol: symbol.to_string(),
         bid,
         ask,
+        bid_size: None,
+        ask_size: None,
         timestamp: ts,
     }])
 }

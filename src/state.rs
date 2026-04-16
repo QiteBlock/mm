@@ -389,6 +389,8 @@ impl MarketState {
                     if let Some(symbol_state) = self.symbols.get_mut(&symbol) {
                         symbol_state.best_bid = None;
                         symbol_state.best_ask = None;
+                        symbol_state.bbo_bid_size = None;
+                        symbol_state.bbo_ask_size = None;
                         symbol_state.mark_price = None;
                         symbol_state.spot_price = None;
                         symbol_state.last_trade_price = None;
@@ -431,16 +433,32 @@ impl MarketState {
                 symbol,
                 bid,
                 ask,
+                bid_size,
+                ask_size,
                 timestamp,
             } => {
                 let symbol_state = self.symbols.entry(symbol).or_default();
                 symbol_state.prev_mid = symbol_state.mid_price();
                 symbol_state.best_bid = Some(bid);
                 symbol_state.best_ask = Some(ask);
+                if bid_size.is_some() {
+                    symbol_state.bbo_bid_size = bid_size;
+                }
+                if ask_size.is_some() {
+                    symbol_state.bbo_ask_size = ask_size;
+                }
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
                 self.last_updated_at = Some(Instant::now());
+            }
+            MarketEvent::FundingRate {
+                symbol,
+                rate,
+                timestamp: _,
+            } => {
+                let symbol_state = self.symbols.entry(symbol).or_default();
+                symbol_state.funding_rate = Some(rate);
             }
             MarketEvent::Trade {
                 symbol,
@@ -520,6 +538,12 @@ pub struct SymbolMarketState {
     pub spot_price: Option<Decimal>,
     pub best_bid: Option<Decimal>,
     pub best_ask: Option<Decimal>,
+    /// BBO queue depth at the best bid, when published by the venue.
+    pub bbo_bid_size: Option<Decimal>,
+    /// BBO queue depth at the best ask, when published by the venue.
+    pub bbo_ask_size: Option<Decimal>,
+    /// Latest periodic funding rate (positive = longs pay shorts).
+    pub funding_rate: Option<Decimal>,
     pub last_trade_price: Option<Decimal>,
     pub last_trade_quantity: Option<Decimal>,
     pub bids: BTreeMap<Decimal, Decimal>,
@@ -536,6 +560,22 @@ impl SymbolMarketState {
             (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::from(2u64)),
             _ => None,
         }
+    }
+
+    /// BBO size-weighted mid-price (microprice).
+    /// Formula: bid * (ask_size / total) + ask * (bid_size / total)
+    /// Returns None when BBO prices or sizes are absent.
+    pub fn microprice(&self) -> Option<Decimal> {
+        let bid = self.best_bid?;
+        let ask = self.best_ask?;
+        let bid_size = self.bbo_bid_size?;
+        let ask_size = self.bbo_ask_size?;
+        let total = bid_size + ask_size;
+        if total.is_zero() {
+            return None;
+        }
+        // Inverted weights: large ask queue → price should be near bid (ask being absorbed)
+        Some(bid * ask_size / total + ask * bid_size / total)
     }
 
     pub fn bbo_spread_bps(&self) -> Option<Decimal> {
