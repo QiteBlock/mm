@@ -39,8 +39,14 @@ pub fn generate_quotes(
     let gauss_sigma = parsed.model.sigma.max(Decimal::new(1, 6));
     let dead_zone = parsed.model.position_dead_zone.abs();
     let spread_multiplier = parsed.model.position_spread_multiplier;
-    let fee_floor_bps =
-        (parsed.venue.maker_fee_rate + parsed.venue.taker_fee_rate) * Decimal::from(10_000u64);
+    // For post-only quotes, the relevant execution-cost floor is maker-only.
+    // Using maker+taker here makes zero-maker venues artificially uncompetitive.
+    let fee_floor_rate = if pair.post_only {
+        parsed.venue.maker_fee_rate
+    } else {
+        parsed.venue.maker_fee_rate + parsed.venue.taker_fee_rate
+    };
+    let fee_floor_bps = fee_floor_rate * Decimal::from(10_000u64);
 
     // A-S parameters
     let gamma = parsed.model.as_gamma.max(Decimal::new(1, 6));
