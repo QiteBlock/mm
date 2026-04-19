@@ -2,15 +2,15 @@ use std::{env, sync::Arc};
 
 use anyhow::{Context, Result};
 use market_making::{
-    account_cleanup::flatten_account_state,
-    config::{AppConfig, ExchangeKind},
-    control::RuntimeControl,
-    engine::MarketMakingEngine,
-    exchange::{
+    adapters::exchange::{
         extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient, AnyExchangeClient,
     },
-    storage::FillStore,
-    telegram::{TelegramCommand, TelegramNotifier},
+    adapters::notifier::telegram::{TelegramCommand, TelegramNotifier},
+    adapters::storage::sqlite::FillStore,
+    config::{AppConfig, ExchangeKind},
+    core::{
+        cleanup::flatten_account_state, engine::MarketMakingEngine, runtime_control::RuntimeControl,
+    },
 };
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "config/settings.toml".to_string());
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
+    let cleanup_min_notional = config.parsed()?.model.min_trade_amount;
 
     let notifier = TelegramNotifier::from_config(config.telegram.clone());
     let exchange = Arc::new(match config.venue.kind {
@@ -62,7 +63,13 @@ async fn main() -> Result<()> {
     if config.runtime.dry_run {
         info!("dry-run enabled; skipping startup cancel-all");
     } else {
-        flatten_account_state(exchange.as_ref(), &notifier, "startup").await?;
+        flatten_account_state(
+            exchange.as_ref(),
+            &notifier,
+            "startup",
+            cleanup_min_notional,
+        )
+        .await?;
     }
 
     let result = tokio::select! {
@@ -76,7 +83,14 @@ async fn main() -> Result<()> {
     if config.runtime.dry_run {
         info!("dry-run enabled; skipping shutdown cancel-all");
     } else {
-        if let Err(err) = flatten_account_state(exchange.as_ref(), &notifier, "shutdown").await {
+        if let Err(err) = flatten_account_state(
+            exchange.as_ref(),
+            &notifier,
+            "shutdown",
+            cleanup_min_notional,
+        )
+        .await
+        {
             error!(?err, "shutdown account cleanup failed");
             notifier
                 .send(format!("market-making shutdown cleanup failed: {err:#}"))
@@ -105,6 +119,7 @@ async fn run_telegram_command_loop(
     notifier: TelegramNotifier,
     control: Arc<RuntimeControl>,
 ) -> Result<()> {
+    let cleanup_min_notional = config.parsed()?.model.min_trade_amount;
     let mut next_offset = None;
     let mut ignore_first_batch = true;
     let telegram_enabled = config
@@ -144,6 +159,7 @@ async fn run_telegram_command_loop(
                                     exchange.as_ref(),
                                     &notifier,
                                     "telegram-stop",
+                                    cleanup_min_notional,
                                 )
                                 .await
                                 {
@@ -168,6 +184,7 @@ async fn run_telegram_command_loop(
                                     exchange.as_ref(),
                                     &notifier,
                                     "telegram-restart",
+                                    cleanup_min_notional,
                                 )
                                 .await
                                 {
