@@ -103,7 +103,7 @@ volatility_floor = "0.0003"
 ob_imbalance_weight = "1.5"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
-flow_spike_pause_threshold = "0.85"
+flow_spike_pause_threshold = "0.92"
 # Microprice: BBO size-weighted mid from GRVT v1.mini.d bq/aq fields.
 microprice_weight = "1.0"
 # VPIN: 5-HYPE buckets, 20-bucket rolling window, widen above 0.65.
