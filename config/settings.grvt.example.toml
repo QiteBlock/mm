@@ -27,32 +27,31 @@ retry_initial_backoff_ms = 250
 retry_max_backoff_ms = 2000
 websocket_reconnect_backoff_ms = 1000
 
-
 [model]
-born_inf_bps = "3"
-born_sup_bps = "8"
-v0 = "0.4"
+born_inf_bps = "1"
+born_sup_bps = "4"
+v0 = "0.005"
 mu = "0.5"
 sigma = "2.7"
 n_points = 1
-min_step_price = "0.001"
-min_step_volume = "0.01"
-min_trade_amount = "5"
-position_size_skew_weight = "0.7"
+min_step_price = "0.1"
+min_step_volume = "0.002"
+min_trade_amount = "100"
+position_size_skew_weight = "0.6"
 position_spread_multiplier = "2.0"
 position_dead_zone = "0.001"
-price_sensitivity_threshold = "0.005"
+price_sensitivity_threshold = "0.003"
 price_sensitivity_scaling_factor = "0.75"
 volume_sensitivity_threshold = "0.10"
-volatility_cut_threshold = "0.015"
+volatility_cut_threshold = "0.010"
 index_forward_buffer_bps = "2"
 max_spread_bps = "20"
 prevent_spread_crossing = true
 cancel_orders_crossing_mid = true
-as_gamma = "0.1"
-as_kappa = "8000.0"
+as_gamma = "0.05"
+as_kappa = "5000.0"
 as_time_horizon = "0.5"
-inventory_lean_bps = "14.0"
+inventory_lean_bps = "8.0"
 as_vol_cap = "0.001"
 # ── Auto-tuning ────────────────────────────────────────────────────────────────
 # Online kappa: replace fixed as_kappa with empirical fill-probability estimate
@@ -73,15 +72,15 @@ post_fill_widen_multiplier = "1.5"
 vpin_widen_multiplier = "1.4"
 
 [risk]
-max_abs_position_usd = "200"
-max_symbol_position_usd = "200"
-max_drawdown_usd = "20"
+max_abs_position_usd = "500"
+max_symbol_position_usd = "500"
+max_drawdown_usd = "30"
 max_open_orders = 20
 emergency_widening_bps = "3"
-circuit_breaker_cooldown_ms = 3000
+circuit_breaker_cooldown_ms = 2000
 emergency_skew_start = "0.65"
 emergency_skew_max = "1.50"
-max_correlated_position_usd = "200"
+max_correlated_position_usd = "500"
 
 [factors]
 volume_window_secs = 30
@@ -89,7 +88,7 @@ n_trade_window_secs = 30
 n_trade_quote_threshold = 0
 volatility_ewma_alpha = "0.2"
 volatility_spread_weight = "20"
-inventory_skew_weight = "2.5"
+inventory_skew_weight = "2.0"
 volume_size_weight = "0.005"
 flow_imbalance_weight = "0.15"
 trade_velocity_alpha = "0.35"
@@ -99,15 +98,17 @@ inventory_risk_constant = "300"
 inventory_skew_convexity = "1.0"
 regime_min_dwell_secs = 3
 cross_symbol_vol_weight = "0.0"
-volatility_floor = "0.0003"
+volatility_floor = "0.0002"
 ob_imbalance_weight = "1.5"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
 flow_spike_pause_threshold = "0.92"
+toxic_regime_block_new_positions_secs = 1800
+toxic_regime_block_new_positions_intensity = "0.7"
 # Microprice: BBO size-weighted mid from GRVT v1.mini.d bq/aq fields.
 microprice_weight = "1.0"
 # VPIN: 5-HYPE buckets, 20-bucket rolling window, widen above 0.65.
-vpin_bucket_size = "50.0"
+vpin_bucket_size = "5000.0"
 vpin_n_buckets = 20
 vpin_widen_threshold = "0.65"
 
@@ -116,14 +117,14 @@ enabled = true
 db_path = "data/fills-grvt-real.db"
 
 [[pairs]]
-symbol = "HYPE/USDT-P"
+symbol = "BTC/USDT-P"
 enabled = true
-max_position_base = "2"
+max_position_base = "0.006"
 price_source = "mid"
 post_only = true
 service_on = true
 side_filter = "both"
-binance_symbol = "hypeusdt"
+binance_symbol = "btcusdt"
 
 [[pairs]]
 symbol = "EDGE/USDT-P"
