@@ -35,7 +35,11 @@ pub fn generate_quotes(
         return Vec::new();
     }
 
-    let v0 = parsed.model.v0;
+    let v0 = if factors.regime == crate::domain::MarketRegime::VolatileBalanced {
+        parsed.model.v0 * Decimal::new(15, 1)
+    } else {
+        parsed.model.v0
+    };
     let effective_born_inf_bps = current_born_inf_bps(parsed, factors.regime_intensity);
     let mu = parsed.model.mu;
     let gauss_sigma = parsed.model.sigma.max(Decimal::new(1, 6));

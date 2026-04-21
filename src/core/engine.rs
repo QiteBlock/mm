@@ -952,6 +952,8 @@ where
         let vol_cut = self.parsed.model.volatility_cut_threshold;
         let min_trade_amount = self.parsed.model.min_trade_amount;
         let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
+        let hard_toxic_stop_secs = 300u64;
+        let min_level_multiplier = Decimal::new(5, 1);
 
         for pair in self.config.pairs.iter().filter(|pair| pair.enabled) {
             let Some(mut factor_snapshot) =
@@ -989,6 +991,10 @@ where
             let has_position =
                 !position_is_effectively_flat(current_position, position_price, min_trade_amount);
             let mut unwind_only = false;
+            let bid_lvl0_multiplier =
+                fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0);
+            let ask_lvl0_multiplier =
+                fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, 0);
             let toxic_regime_blocks_new_positions = factor_snapshot.regime
                 == MarketRegime::TrendingToxic
                 && factor_snapshot.regime_intensity
@@ -998,6 +1004,10 @@ where
                         .toxic_regime_block_new_positions_intensity
                 && factor_snapshot.toxic_regime_persistence_secs
                     >= self.parsed.factors.toxic_regime_block_new_positions_secs;
+            let sustained_fully_toxic = factor_snapshot.toxic_regime_persistence_secs
+                >= hard_toxic_stop_secs
+                && bid_lvl0_multiplier <= min_level_multiplier
+                && ask_lvl0_multiplier <= min_level_multiplier;
 
             if factor_snapshot.recent_trade_count < n_trade_threshold {
                 if has_position {
@@ -1031,6 +1041,30 @@ where
                         persistence_secs = factor_snapshot.toxic_regime_persistence_secs,
                         threshold_secs = self.parsed.factors.toxic_regime_block_new_positions_secs,
                         "persistent trending-toxic regime; blocking new positions"
+                    );
+                    continue;
+                }
+            }
+            if sustained_fully_toxic {
+                if has_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        toxic_persistence_secs = factor_snapshot.toxic_regime_persistence_secs,
+                        hard_stop_secs = hard_toxic_stop_secs,
+                        bid_lvl0_multiplier = %bid_lvl0_multiplier,
+                        ask_lvl0_multiplier = %ask_lvl0_multiplier,
+                        "all recent fills remain toxic with size pinned at the floor; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        toxic_persistence_secs = factor_snapshot.toxic_regime_persistence_secs,
+                        hard_stop_secs = hard_toxic_stop_secs,
+                        bid_lvl0_multiplier = %bid_lvl0_multiplier,
+                        ask_lvl0_multiplier = %ask_lvl0_multiplier,
+                        "all recent fills remain toxic with size pinned at the floor; suppressing quotes entirely"
                     );
                     continue;
                 }
@@ -1154,8 +1188,8 @@ where
                 degraded,
                 ws_discrepancies,
                 rest_failures,
-                bid_lvl0_multiplier = %fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0),
-                ask_lvl0_multiplier = %fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, 0),
+                bid_lvl0_multiplier = %bid_lvl0_multiplier,
+                ask_lvl0_multiplier = %ask_lvl0_multiplier,
                 "factor snapshot"
             );
 
@@ -1287,7 +1321,11 @@ where
 
                 // Fix 2: for the unwind side, floor quantity to min_trade_amount/price
                 // so skew-reduced sizes never disappear below the notional floor.
-                let effective_quantity = quantize_order_quantity_for_checks(quantity, instrument);
+                let effective_quantity = quantize_order_quantity_for_checks(
+                    quantity,
+                    instrument,
+                    self.parsed.model.min_step_volume,
+                );
                 if effective_quantity <= Decimal::ZERO {
                     continue;
                 }
@@ -1296,7 +1334,11 @@ where
                         // Floor to the minimum notional; the position MUST be quoted.
                         quantity = (quote_min_trade_amount / price).max(Decimal::new(1, 9));
                         // re-quantize; if still zero the instrument step is too large — skip
-                        let floored = quantize_order_quantity_for_checks(quantity, instrument);
+                        let floored = quantize_order_quantity_for_checks(
+                            quantity,
+                            instrument,
+                            self.parsed.model.min_step_volume,
+                        );
                         if floored <= Decimal::ZERO {
                             continue;
                         }
@@ -1317,8 +1359,11 @@ where
                     if quantity > *remaining_capacity {
                         quantity = *remaining_capacity;
                     }
-                    let effective_quantity =
-                        quantize_order_quantity_for_checks(quantity, instrument);
+                    let effective_quantity = quantize_order_quantity_for_checks(
+                        quantity,
+                        instrument,
+                        self.parsed.model.min_step_volume,
+                    );
                     if effective_quantity <= Decimal::ZERO
                         || effective_quantity * price < quote_min_trade_amount
                     {
@@ -1327,6 +1372,7 @@ where
                             let floored_qty = quantize_order_quantity_for_checks(
                                 (quote_min_trade_amount / price).max(Decimal::new(1, 9)),
                                 instrument,
+                                self.parsed.model.min_step_volume,
                             );
                             if floored_qty > Decimal::ZERO && floored_qty <= *remaining_capacity {
                                 quantity = floored_qty;
@@ -1393,8 +1439,11 @@ where
                 };
                 if let Some(price) = exit_price {
                     let quantity = instrument.min_order_size.max(current_position.abs());
-                    let effective_quantity =
-                        quantize_order_quantity_for_checks(quantity, instrument);
+                    let effective_quantity = quantize_order_quantity_for_checks(
+                        quantity,
+                        instrument,
+                        self.parsed.model.min_step_volume,
+                    );
                     let effective_notional = effective_quantity * price;
                     if effective_quantity <= Decimal::ZERO || effective_notional < min_trade_amount
                     {
@@ -1463,13 +1512,20 @@ fn round_to_tick_for_side(price: Decimal, tick_size: Option<Decimal>, side: Side
     }
 }
 
-fn quantize_order_quantity_for_checks(quantity: Decimal, instrument: &InstrumentMeta) -> Decimal {
+fn quantize_order_quantity_for_checks(
+    quantity: Decimal,
+    instrument: &InstrumentMeta,
+    config_min_step: Decimal,
+) -> Decimal {
     if quantity <= Decimal::ZERO {
         return Decimal::ZERO;
     }
 
     let decimal_step = Decimal::new(1, instrument.underlying_decimals.min(28));
-    let step = instrument.min_order_size.max(decimal_step);
+    let step = instrument
+        .min_order_size
+        .max(decimal_step)
+        .max(config_min_step);
     if step <= Decimal::ZERO {
         return quantity;
     }

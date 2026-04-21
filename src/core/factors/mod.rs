@@ -91,6 +91,8 @@ struct SymbolFactorState {
     regime_intensity: Decimal,
     /// When the current regime was entered (S5 dwell time).
     regime_entered_at: Option<DateTime<Utc>>,
+    /// Rolling 600s toxicity window sampled once per factor cycle.
+    toxic_history: VecDeque<(DateTime<Utc>, bool)>,
     trade_velocity_ewma: Decimal,
     bbo_spread_ewma: Option<Decimal>,
     last_vpin_trade_time: Option<DateTime<Utc>>,
@@ -115,6 +117,7 @@ impl Default for SymbolFactorState {
             regime: MarketRegime::Quiet,
             regime_intensity: Decimal::ZERO,
             regime_entered_at: Some(Utc::now()),
+            toxic_history: VecDeque::new(),
             trade_velocity_ewma: Decimal::ZERO,
             bbo_spread_ewma: None,
             last_vpin_trade_time: None,
@@ -362,14 +365,23 @@ impl FactorEngine {
             symbol_state.regime_entered_at = Some(now);
         }
         let regime = symbol_state.regime;
-        let toxic_regime_persistence_secs = if regime == MarketRegime::TrendingToxic {
-            symbol_state
-                .regime_entered_at
-                .map(|entered_at| (now - entered_at).num_seconds().max(0) as u64)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let is_toxic = regime == MarketRegime::TrendingToxic;
+        symbol_state.toxic_history.push_back((now, is_toxic));
+        let toxic_window_start = now - Duration::seconds(600);
+        while symbol_state
+            .toxic_history
+            .front()
+            .map(|(timestamp, _)| *timestamp < toxic_window_start)
+            .unwrap_or(false)
+        {
+            symbol_state.toxic_history.pop_front();
+        }
+        maybe_shrink_vecdeque(&mut symbol_state.toxic_history, "factor_toxic_history");
+        let toxic_regime_persistence_secs = symbol_state
+            .toxic_history
+            .iter()
+            .filter(|(_, toxic)| *toxic)
+            .count() as u64;
 
         // Continuous intensity: flow magnitude drives toxic intensity, vol drives volatile intensity.
         let flow_intensity = flow_abs.min(Decimal::ONE);
