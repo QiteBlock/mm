@@ -222,6 +222,8 @@ pub struct FactorSnapshot {
     pub post_fill_widen_ask: Decimal,
     /// Extra spread widening applied during a sustained flow spike.
     pub flow_spike_widen_multiplier: Decimal,
+    /// Seconds spent continuously in the current TrendingToxic regime.
+    pub toxic_regime_persistence_secs: u64,
 }
 
 impl Default for FactorSnapshot {
@@ -246,6 +248,7 @@ impl Default for FactorSnapshot {
             post_fill_widen_bid: Decimal::ONE,
             post_fill_widen_ask: Decimal::ONE,
             flow_spike_widen_multiplier: Decimal::ONE,
+            toxic_regime_persistence_secs: 0,
         }
     }
 }

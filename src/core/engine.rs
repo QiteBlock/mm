@@ -29,7 +29,10 @@ use crate::{
         runtime_control::RuntimeControl,
         state::BotState,
     },
-    domain::{Fill, InstrumentMeta, MarketEvent, OrderRequest, OrderType, PrivateEvent, Side},
+    domain::{
+        Fill, InstrumentMeta, MarketEvent, MarketRegime, OrderRequest, OrderType, PrivateEvent,
+        Side,
+    },
 };
 
 pub struct MarketMakingEngine<E> {
@@ -986,6 +989,15 @@ where
             let has_position =
                 !position_is_effectively_flat(current_position, position_price, min_trade_amount);
             let mut unwind_only = false;
+            let toxic_regime_blocks_new_positions = factor_snapshot.regime
+                == MarketRegime::TrendingToxic
+                && factor_snapshot.regime_intensity
+                    >= self
+                        .parsed
+                        .factors
+                        .toxic_regime_block_new_positions_intensity
+                && factor_snapshot.toxic_regime_persistence_secs
+                    >= self.parsed.factors.toxic_regime_block_new_positions_secs;
 
             if factor_snapshot.recent_trade_count < n_trade_threshold {
                 if has_position {
@@ -998,6 +1010,28 @@ where
                     );
                     unwind_only = true;
                 } else {
+                    continue;
+                }
+            }
+            if toxic_regime_blocks_new_positions {
+                if has_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        regime_intensity = %factor_snapshot.regime_intensity,
+                        persistence_secs = factor_snapshot.toxic_regime_persistence_secs,
+                        threshold_secs = self.parsed.factors.toxic_regime_block_new_positions_secs,
+                        "persistent trending-toxic regime; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        regime_intensity = %factor_snapshot.regime_intensity,
+                        persistence_secs = factor_snapshot.toxic_regime_persistence_secs,
+                        threshold_secs = self.parsed.factors.toxic_regime_block_new_positions_secs,
+                        "persistent trending-toxic regime; blocking new positions"
+                    );
                     continue;
                 }
             }
@@ -1114,6 +1148,7 @@ where
                 kappa_estimate = ?factor_snapshot.kappa_estimate,
                 post_fill_widen_bid = %factor_snapshot.post_fill_widen_bid,
                 post_fill_widen_ask = %factor_snapshot.post_fill_widen_ask,
+                toxic_regime_persistence_secs = factor_snapshot.toxic_regime_persistence_secs,
                 inventory_skew = %factor_snapshot.inventory_skew,
                 recent_trade_count = factor_snapshot.recent_trade_count,
                 degraded,

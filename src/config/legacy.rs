@@ -301,6 +301,14 @@ impl AppConfig {
                     "factors.flow_spike_pause_threshold",
                     &self.factors.flow_spike_pause_threshold,
                 )?,
+                toxic_regime_block_new_positions_secs: self
+                    .factors
+                    .toxic_regime_block_new_positions_secs,
+                toxic_regime_block_new_positions_intensity: parse_decimal(
+                    "factors.toxic_regime_block_new_positions_intensity",
+                    &self.factors.toxic_regime_block_new_positions_intensity,
+                )?
+                .clamp(Decimal::ZERO, Decimal::ONE),
                 microprice_weight: parse_decimal(
                     "factors.microprice_weight",
                     &self.factors.microprice_weight,
@@ -469,6 +477,10 @@ pub struct ParsedFactorConfig {
     /// |flow_direction| above this value pauses quoting for the symbol.
     /// 0 = disabled. Typical: 0.7.
     pub flow_spike_pause_threshold: Decimal,
+    /// When TrendingToxic persists beyond this duration, do not open fresh positions.
+    pub toxic_regime_block_new_positions_secs: u64,
+    /// Minimum regime intensity required before persistent toxic-regime protection activates.
+    pub toxic_regime_block_new_positions_intensity: Decimal,
     /// Blend weight for microprice vs raw mid [0, 1].
     pub microprice_weight: Decimal,
     /// Weight applied to (microprice - grvt_mid) when anchoring to CEX spot.
@@ -629,6 +641,14 @@ fn default_flow_spike_pause_threshold() -> String {
 
 fn default_regime_intensity_alpha() -> String {
     "0.2".to_string()
+}
+
+fn default_toxic_regime_block_new_positions_secs() -> u64 {
+    30 * 60
+}
+
+fn default_toxic_regime_block_new_positions_intensity() -> String {
+    "0.7".to_string()
 }
 
 fn default_microprice_weight() -> String {
@@ -836,6 +856,12 @@ pub struct FactorConfig {
     /// |flow_direction| above this threshold pauses quoting. 0 = disabled.
     #[serde(default = "default_flow_spike_pause_threshold")]
     pub flow_spike_pause_threshold: String,
+    /// Duration in seconds before persistent TrendingToxic blocks new positions.
+    #[serde(default = "default_toxic_regime_block_new_positions_secs")]
+    pub toxic_regime_block_new_positions_secs: u64,
+    /// Minimum TrendingToxic intensity before the persistent block activates.
+    #[serde(default = "default_toxic_regime_block_new_positions_intensity")]
+    pub toxic_regime_block_new_positions_intensity: String,
     /// Blend weight for microprice vs raw mid [0, 1]. 1 = full microprice, 0 = raw mid.
     /// Requires BBO size data from the venue (GRVT v1.mini.d `bq`/`aq`).
     #[serde(default = "default_microprice_weight")]

@@ -362,6 +362,14 @@ impl FactorEngine {
             symbol_state.regime_entered_at = Some(now);
         }
         let regime = symbol_state.regime;
+        let toxic_regime_persistence_secs = if regime == MarketRegime::TrendingToxic {
+            symbol_state
+                .regime_entered_at
+                .map(|entered_at| (now - entered_at).num_seconds().max(0) as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         // Continuous intensity: flow magnitude drives toxic intensity, vol drives volatile intensity.
         let flow_intensity = flow_abs.min(Decimal::ONE);
@@ -510,6 +518,7 @@ impl FactorEngine {
             post_fill_widen_bid: Decimal::ONE, // populated by engine after compute()
             post_fill_widen_ask: Decimal::ONE,
             flow_spike_widen_multiplier: Decimal::ONE,
+            toxic_regime_persistence_secs,
         })
     }
 }
