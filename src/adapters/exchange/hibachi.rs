@@ -954,6 +954,7 @@ fn parse_position(value: &Value) -> Option<Position> {
             .and_then(as_decimal)
             .map(|pnl| !pnl.is_zero())
             .unwrap_or(false),
+        opened_at: None,
     })
 }
 

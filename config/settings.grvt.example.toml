@@ -96,14 +96,14 @@ trade_velocity_burst_threshold = "2"
 bbo_spread_vol_weight = "0.05"
 inventory_risk_constant = "300"
 inventory_skew_convexity = "1.0"
-regime_min_dwell_secs = 3
+regime_min_dwell_secs = 10
 cross_symbol_vol_weight = "0.0"
 volatility_floor = "0.0002"
 ob_imbalance_weight = "1.5"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
-flow_spike_pause_threshold = "0.92"
-toxic_regime_block_new_positions_secs = 1800
+flow_spike_pause_threshold = "0.96"
+toxic_regime_block_new_positions_secs = 420
 toxic_regime_block_new_positions_intensity = "0.7"
 # Microprice: BBO size-weighted mid from GRVT v1.mini.d bq/aq fields.
 microprice_weight = "1.0"
@@ -125,6 +125,16 @@ post_only = true
 service_on = true
 side_filter = "both"
 binance_symbol = "btcusdt"
+
+[[pairs]]
+symbol = "HYPE/USDT-P"
+enabled = false
+max_position_base = "10"
+price_source = "mid"
+post_only = true
+service_on = true
+side_filter = "both"
+binance_symbol = "hypeusdt"
 
 [[pairs]]
 symbol = "EDGE/USDT-P"

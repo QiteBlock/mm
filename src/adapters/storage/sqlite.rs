@@ -204,6 +204,7 @@ impl FillStore {
                     realized_pnl: Decimal::from_str(&realized_pnl)?,
                     unrealized_pnl: Decimal::ZERO,
                     pnl_is_authoritative: false,
+                    opened_at: None,
                 },
             );
         }

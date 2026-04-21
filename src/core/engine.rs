@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use rust_decimal::Decimal;
 use tokio::{
     sync::mpsc,
@@ -954,6 +954,9 @@ where
         let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
+        let non_unwind_size_reduction = Decimal::new(25, 2);
+        let position_hold_timeout = ChronoDuration::minutes(10);
+        let stale_exit_spread_multiplier = Decimal::new(5, 1);
 
         for pair in self.config.pairs.iter().filter(|pair| pair.enabled) {
             let Some(mut factor_snapshot) =
@@ -986,6 +989,10 @@ where
                 .get(&pair.symbol)
                 .map(|position| position.quantity)
                 .unwrap_or(Decimal::ZERO);
+            let current_position_opened_at = state
+                .positions
+                .get(&pair.symbol)
+                .and_then(|position| position.opened_at);
             let position_price =
                 position_price_for_symbol(state, &pair.symbol, factor_snapshot.price_index);
             let has_position =
@@ -1264,6 +1271,9 @@ where
             };
 
             let mut symbol_orders = Vec::new();
+            let stale_position = current_position_opened_at
+                .map(|opened_at| Utc::now() - opened_at > position_hold_timeout)
+                .unwrap_or(false);
 
             for quote in quotes
                 .into_iter()
@@ -1276,8 +1286,9 @@ where
                     Side::Ask => current_position > Decimal::ZERO,
                     Side::Bid => current_position < Decimal::ZERO,
                 };
+                let mut quantity = quote.quantity;
                 if unwind_only && !is_unwind {
-                    continue;
+                    quantity *= non_unwind_size_reduction;
                 }
                 if !is_unwind {
                     if let Some(&cooled_at) = side_cooldown.get(&(pair.symbol.clone(), quote.side))
@@ -1295,7 +1306,6 @@ where
 
                 let mut price =
                     round_to_tick_for_side(quote.price, instrument.tick_size, quote.side);
-                let mut quantity = quote.quantity;
                 if degraded {
                     quantity *= Decimal::new(7, 1);
                 }
@@ -1317,6 +1327,24 @@ where
                 if self.config.model.prevent_spread_crossing {
                     price =
                         clip_to_bbo(price, quote.side, best_bid, best_ask, instrument.tick_size);
+                }
+                if stale_position && is_unwind {
+                    price = tighten_exit_quote_toward_reference(
+                        price,
+                        quote.side,
+                        factor_snapshot.price_index,
+                        stale_exit_spread_multiplier,
+                    );
+                    price = round_to_tick_for_side(price, instrument.tick_size, quote.side);
+                    if self.config.model.prevent_spread_crossing {
+                        price = clip_to_bbo(
+                            price,
+                            quote.side,
+                            best_bid,
+                            best_ask,
+                            instrument.tick_size,
+                        );
+                    }
                 }
 
                 // Fix 2: for the unwind side, floor quantity to min_trade_amount/price
@@ -1535,6 +1563,28 @@ fn quantize_order_quantity_for_checks(
         step.normalize()
     } else {
         aligned.normalize()
+    }
+}
+
+fn tighten_exit_quote_toward_reference(
+    price: Decimal,
+    side: Side,
+    reference_price: Decimal,
+    spread_multiplier: Decimal,
+) -> Decimal {
+    if price <= Decimal::ZERO || reference_price <= Decimal::ZERO {
+        return price;
+    }
+
+    match side {
+        Side::Ask => {
+            let distance = (price - reference_price).max(Decimal::ZERO);
+            (reference_price + distance * spread_multiplier).max(reference_price)
+        }
+        Side::Bid => {
+            let distance = (reference_price - price).max(Decimal::ZERO);
+            (reference_price - distance * spread_multiplier).min(reference_price)
+        }
     }
 }
 

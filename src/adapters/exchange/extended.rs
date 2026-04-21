@@ -1082,6 +1082,7 @@ fn parse_extended_position(position: &ExtendedPosition) -> Option<Position> {
             .ok()
             .map(|pnl| !pnl.is_zero())
             .unwrap_or(false),
+        opened_at: None,
     })
 }
 

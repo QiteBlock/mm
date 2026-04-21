@@ -199,8 +199,10 @@ pub fn generate_quotes(
 
     // S1: Level 0 anchors to BBO, but no worse than A-S theoretical price.
     // If live BBO exists, use it clamped to A-S. If no BBO, fall back to A-S.
-    let level0_unclamped_bps =
-        effective_born_inf_bps * regime_spread_multiplier * vpin_widen_mult * flow_spike_widen_mult;
+    let level0_unclamped_bps = (effective_born_inf_bps + factors.volatility)
+        * regime_spread_multiplier
+        * vpin_widen_mult
+        * flow_spike_widen_mult;
     let level0_spread_bps = level0_unclamped_bps
         .max(fee_floor_bps)
         .min(parsed.model.max_spread_bps);
@@ -264,7 +266,7 @@ pub fn generate_quotes(
 
         // Spread for this level: independent grid from born_inf to born_sup.
         // Apply regime + VPIN multipliers first, then clamp to fee floor.
-        let unclamped_bps = (effective_born_inf_bps + step * level_decimal)
+        let unclamped_bps = (effective_born_inf_bps + factors.volatility + step * level_decimal)
             * regime_spread_multiplier
             * vpin_widen_mult
             * flow_spike_widen_mult;

@@ -300,6 +300,22 @@ impl BotState {
             if !merged.pnl_is_authoritative && !existing.realized_pnl.is_zero() {
                 merged.realized_pnl = existing.realized_pnl;
             }
+            if !existing.quantity.is_zero()
+                && !merged.quantity.is_zero()
+                && merged.quantity.signum() != existing.quantity.signum()
+            {
+                merged.opened_at = Some(Utc::now());
+            } else if !existing.quantity.is_zero() && !merged.quantity.is_zero() {
+                merged.opened_at = existing.opened_at;
+            } else if existing.quantity.is_zero() && !merged.quantity.is_zero() {
+                merged.opened_at = Some(Utc::now());
+            }
+        } else if !merged.quantity.is_zero() {
+            merged.opened_at = Some(Utc::now());
+        }
+
+        if merged.quantity.is_zero() {
+            merged.opened_at = None;
         }
 
         self.positions.insert(merged.symbol.clone(), merged);
@@ -344,6 +360,15 @@ impl BotState {
         }
 
         position.quantity = new_quantity;
+        if previous_quantity.is_zero() && !new_quantity.is_zero() {
+            position.opened_at = Some(fill.timestamp);
+        } else if new_quantity.is_zero() {
+            position.opened_at = None;
+        } else if !previous_quantity.is_zero()
+            && new_quantity.signum() != previous_quantity.signum()
+        {
+            position.opened_at = Some(fill.timestamp);
+        }
         let estimated_fee = (fill.price * fill.quantity).abs() * self.maker_fee_rate;
         self.pnl.total_fees += estimated_fee;
         self.fills.push_back(fill);

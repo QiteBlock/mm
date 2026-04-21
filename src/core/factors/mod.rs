@@ -93,6 +93,7 @@ struct SymbolFactorState {
     regime_entered_at: Option<DateTime<Utc>>,
     /// Rolling 600s toxicity window sampled once per factor cycle.
     toxic_history: VecDeque<(DateTime<Utc>, bool)>,
+    spread_floor: Decimal,
     trade_velocity_ewma: Decimal,
     bbo_spread_ewma: Option<Decimal>,
     last_vpin_trade_time: Option<DateTime<Utc>>,
@@ -118,6 +119,7 @@ impl Default for SymbolFactorState {
             regime_intensity: Decimal::ZERO,
             regime_entered_at: Some(Utc::now()),
             toxic_history: VecDeque::new(),
+            spread_floor: Decimal::ZERO,
             trade_velocity_ewma: Decimal::ZERO,
             bbo_spread_ewma: None,
             last_vpin_trade_time: None,
@@ -425,6 +427,14 @@ impl FactorEngine {
         let base_volatility_addon = factor_spread_addon(parsed, volatility);
         let volatility_addon =
             (base_volatility_addon + bbo_spread_component + cross_flow.abs()) * time_multiplier;
+        let spread_floor_decay = Decimal::new(995, 3);
+        if volatility_addon > symbol_state.spread_floor {
+            symbol_state.spread_floor = volatility_addon;
+        } else {
+            symbol_state.spread_floor =
+                (symbol_state.spread_floor * spread_floor_decay).max(Decimal::ZERO);
+        }
+        let effective_volatility_addon = volatility_addon.max(symbol_state.spread_floor);
 
         if symbol_state.bbo_spread_ewma.is_none() {
             return None;
@@ -513,7 +523,7 @@ impl FactorEngine {
         Some(FactorSnapshot {
             price_index,
             raw_volatility: volatility,
-            volatility: volatility_addon,
+            volatility: effective_volatility_addon,
             volume_imbalance,
             flow_direction: flow_direction_clamped,
             inventory_skew,

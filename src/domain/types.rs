@@ -111,6 +111,7 @@ pub struct Position {
     pub realized_pnl: Decimal,
     pub unrealized_pnl: Decimal,
     pub pnl_is_authoritative: bool,
+    pub opened_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
